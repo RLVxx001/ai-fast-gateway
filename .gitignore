@@ -1,0 +1,6 @@
+codex-fast-proxy
+ai-fast-gateway
+*.log
+*.pid
+*.stdout
+.DS_Store

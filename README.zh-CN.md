@@ -141,6 +141,11 @@ CC_WS_BRIDGE_FALLBACK_HTTP=true
 CC_WS_BRIDGE_DEBUG_FRAMES=false
 CC_WS_BRIDGE_FIRST_EVENT_TIMEOUT_MS=15000
 WS_DEBUG_PAYLOAD_BYTES=0
+CC_WS_POOL_MODE=client
+CC_WS_POOL_MAX_CONNS_PER_CLIENT=20
+CC_WS_POOL_MAX_IDLE_PER_CLIENT=20
+CC_WS_POOL_IDLE_TTL_SECONDS=600
+CC_WS_POOL_ACQUIRE_TIMEOUT_MS=3000
 ```
 
 ## WebSocket 说明
@@ -154,6 +159,24 @@ CC_WS_BRIDGE_ENABLED=true
 ```
 
 开启后，Claude Code 的 `/v1/messages` 请求会被转换成上游 `/responses` WebSocket 请求，再把上游 WS 事件转换回 Anthropic SSE 响应。这个模式适合实验和调试，生产使用前建议先压测和观察日志。
+
+默认 WS 复用策略是 `client`：
+
+```text
+CC_WS_POOL_MODE=client
+CC_WS_POOL_MAX_CONNS_PER_CLIENT=20
+CC_WS_POOL_MAX_IDLE_PER_CLIENT=20
+CC_WS_POOL_IDLE_TTL_SECONDS=600
+CC_WS_POOL_ACQUIRE_TIMEOUT_MS=3000
+```
+
+含义是：同一个客户端身份共享一个最多 20 条上游 WS 的连接池；每条 WS 同一时间只跑一个请求，收到终止事件后回池，后续同 session 请求可以串行复用这条 WS。客户端身份由请求 IP、认证头哈希和 User-Agent 哈希组成；session 由 `x-claude-code-session-id` 或 `prompt_cache_key` 识别。不同 session 不会混用同一条 WS，但会共享这个客户端池的 20 条连接上限。
+
+如果要退回旧逻辑，每个请求新建并关闭一条 WS：
+
+```text
+CC_WS_POOL_MODE=request
+```
 
 ## 注意事项
 

@@ -49,6 +49,11 @@ type config struct {
 	ccWSBridgeDebug     bool
 	ccWSFirstEventWait  time.Duration
 	wsDebugPayloadBytes int
+	ccWSPoolMode        string
+	ccWSPoolMaxConns    int
+	ccWSPoolMaxIdle     int
+	ccWSPoolIdleTTL     time.Duration
+	ccWSPoolAcquireWait time.Duration
 }
 
 func main() {
@@ -61,7 +66,8 @@ func main() {
 	}
 
 	proxy := &proxyServer{
-		cfg: cfg,
+		cfg:        cfg,
+		bridgePool: newBridgeWSPoolManager(cfg),
 		client: &http.Client{
 			Timeout: 0,
 			Transport: &http.Transport{
@@ -95,6 +101,8 @@ func main() {
 		cfg.ccWSBridgeEnabled, cfg.ccWSBridgePath, cfg.ccWSBridgeFallback, cfg.ccWSBridgeDebug)
 	log.Printf("cc websocket bridge timeout: first_event_wait=%s", cfg.ccWSFirstEventWait)
 	log.Printf("websocket debug: payload_preview_bytes=%d", cfg.wsDebugPayloadBytes)
+	log.Printf("cc websocket pool: mode=%s max_conns_per_client=%d max_idle_per_client=%d idle_ttl=%s acquire_timeout=%s",
+		cfg.ccWSPoolMode, cfg.ccWSPoolMaxConns, cfg.ccWSPoolMaxIdle, cfg.ccWSPoolIdleTTL, cfg.ccWSPoolAcquireWait)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}
@@ -115,6 +123,11 @@ func loadConfig() (config, error) {
 	ccWSBridgeDebug := flag.Bool("cc-ws-bridge-debug-frames", envBoolOrDefault("CC_WS_BRIDGE_DEBUG_FRAMES", false), "log upstream WS frame event types for bridge debugging")
 	ccWSFirstEventWaitMS := flag.Int("cc-ws-bridge-first-event-timeout-ms", envIntOrDefault("CC_WS_BRIDGE_FIRST_EVENT_TIMEOUT_MS", 15000), "maximum time to wait for first upstream WS event before fallback")
 	wsDebugPayloadBytes := flag.Int("ws-debug-payload-bytes", envIntOrDefault("WS_DEBUG_PAYLOAD_BYTES", 0), "optional redacted JSON payload preview bytes for websocket debugging")
+	ccWSPoolMode := flag.String("cc-ws-pool-mode", envOrDefault("CC_WS_POOL_MODE", "client"), "upstream WS reuse mode for Claude Code bridge: request or client")
+	ccWSPoolMaxConns := flag.Int("cc-ws-pool-max-conns-per-client", envIntOrDefault("CC_WS_POOL_MAX_CONNS_PER_CLIENT", 20), "maximum reusable upstream WS connections per client")
+	ccWSPoolMaxIdle := flag.Int("cc-ws-pool-max-idle-per-client", envIntOrDefault("CC_WS_POOL_MAX_IDLE_PER_CLIENT", 20), "maximum idle upstream WS connections per client")
+	ccWSPoolIdleTTLSeconds := flag.Int("cc-ws-pool-idle-ttl-seconds", envIntOrDefault("CC_WS_POOL_IDLE_TTL_SECONDS", 600), "close reusable upstream WS connections after this many idle seconds")
+	ccWSPoolAcquireTimeoutMS := flag.Int("cc-ws-pool-acquire-timeout-ms", envIntOrDefault("CC_WS_POOL_ACQUIRE_TIMEOUT_MS", 3000), "maximum time to wait for an available upstream WS connection")
 	flag.Parse()
 
 	upstream, err := url.Parse(strings.TrimSpace(*upstreamRaw))
@@ -139,6 +152,11 @@ func loadConfig() (config, error) {
 		ccWSBridgeDebug:     *ccWSBridgeDebug,
 		ccWSFirstEventWait:  time.Duration(positiveOrDefault(*ccWSFirstEventWaitMS, 15000)) * time.Millisecond,
 		wsDebugPayloadBytes: maxInt(*wsDebugPayloadBytes, 0),
+		ccWSPoolMode:        normalizeWSPoolMode(*ccWSPoolMode),
+		ccWSPoolMaxConns:    positiveOrDefault(*ccWSPoolMaxConns, 20),
+		ccWSPoolMaxIdle:     maxInt(*ccWSPoolMaxIdle, 0),
+		ccWSPoolIdleTTL:     time.Duration(positiveOrDefault(*ccWSPoolIdleTTLSeconds, 600)) * time.Second,
+		ccWSPoolAcquireWait: time.Duration(positiveOrDefault(*ccWSPoolAcquireTimeoutMS, 3000)) * time.Millisecond,
 	}, nil
 }
 
@@ -217,6 +235,17 @@ func normalizePath(value string, fallback string) string {
 	return "/" + strings.TrimLeft(value, "/")
 }
 
+func normalizeWSPoolMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "request", "off", "disabled", "none":
+		return "request"
+	case "client", "":
+		return "client"
+	default:
+		return "client"
+	}
+}
+
 func positiveOrDefault(value int, fallback int) int {
 	if value <= 0 {
 		return fallback
@@ -232,8 +261,9 @@ func maxInt(value int, minimum int) int {
 }
 
 type proxyServer struct {
-	cfg    config
-	client *http.Client
+	cfg        config
+	client     *http.Client
+	bridgePool *bridgeWSPoolManager
 }
 
 func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {

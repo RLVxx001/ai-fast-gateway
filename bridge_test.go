@@ -232,3 +232,100 @@ func TestClaudeWSBridgeHandlesNonStreamRequest(t *testing.T) {
 		t.Fatalf("text = %v", text["text"])
 	}
 }
+
+func TestClaudeWSBridgeClientPoolReusesConnectionSerially(t *testing.T) {
+	handshakes := make(chan struct{}, 2)
+	upstreamCreates := make(chan map[string]any, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		handshakes <- struct{}{}
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		accept := websocketAccept(r.Header.Get("Sec-WebSocket-Key"))
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"))
+
+		for i := 0; i < 2; i++ {
+			frame, err := readWSFrame(rw.Reader)
+			if err != nil {
+				t.Errorf("read create frame %d: %v", i, err)
+				return
+			}
+			var create map[string]any
+			if err := json.Unmarshal(frame.payload, &create); err != nil {
+				t.Errorf("decode create frame %d: %v", i, err)
+				return
+			}
+			upstreamCreates <- create
+			events := []string{
+				`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message"}}`,
+				`{"type":"response.output_text.delta","output_index":0,"delta":"hello"}`,
+				`{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}`,
+				`{"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":2}}}`,
+			}
+			for _, event := range events {
+				if err := writeWSFrame(conn, wsFrame{fin: true, opcode: 1, payload: []byte(event)}, false); err != nil {
+					t.Errorf("write event %d: %v", i, err)
+					return
+				}
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(&proxyServer{cfg: config{
+		upstream:           upstreamURL,
+		ccWSBridgeEnabled:  true,
+		ccWSBridgePath:     "/responses",
+		ccWSBridgeFallback: false,
+		ccWSPoolMode:       "client",
+		ccWSPoolMaxConns:   20,
+		ccWSPoolMaxIdle:    20,
+		ccWSPoolIdleTTL:    time.Minute,
+	}})
+	defer proxy.Close()
+
+	for i := 0; i < 2; i++ {
+		body := `{"model":"gpt-5.5","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+		resp, err := http.Post(proxy.URL+"/v1/messages?beta=true", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d body=%s", resp.StatusCode, buf)
+		}
+		if !strings.Contains(string(buf), `"text":"hello"`) {
+			t.Fatalf("response did not contain text: %s", buf)
+		}
+		select {
+		case <-upstreamCreates:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for upstream create")
+		}
+	}
+
+	select {
+	case <-handshakes:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for first handshake")
+	}
+	select {
+	case <-handshakes:
+		t.Fatal("expected pooled websocket to be reused without second handshake")
+	default:
+	}
+}

@@ -36,6 +36,11 @@ CC_WS_BRIDGE_FALLBACK_HTTP=true
 CC_WS_BRIDGE_DEBUG_FRAMES=false
 CC_WS_BRIDGE_FIRST_EVENT_TIMEOUT_MS=15000
 WS_DEBUG_PAYLOAD_BYTES=0
+CC_WS_POOL_MODE=client
+CC_WS_POOL_MAX_CONNS_PER_CLIENT=20
+CC_WS_POOL_MAX_IDLE_PER_CLIENT=20
+CC_WS_POOL_IDLE_TTL_SECONDS=600
+CC_WS_POOL_ACQUIRE_TIMEOUT_MS=3000
 ```
 
 ## Build
@@ -89,6 +94,13 @@ MAX_IDLE_CONNS_PER_HOST=100
 CC_WS_BRIDGE_ENABLED=false
 ```
 
+In `client` pool mode, each client identity gets a reusable upstream WS pool. A single
+WS connection runs one request at a time, then returns to the pool and can be reused
+serially by later requests from the same session. Different sessions do not share the
+same WS connection, but they share the client's pool limit. The default pool size is
+20 upstream WS connections per client. Set `CC_WS_POOL_MODE=request` to use the old
+one-request-one-WS behavior.
+
 Health check:
 
 ```bash
@@ -120,6 +132,8 @@ docker run -d \
   -e MAX_IDLE_CONNS=256 \
   -e MAX_IDLE_CONNS_PER_HOST=256 \
   -e CC_WS_BRIDGE_ENABLED=false \
+  -e CC_WS_POOL_MODE=client \
+  -e CC_WS_POOL_MAX_CONNS_PER_CLIENT=20 \
   ghcr.io/your-org/ai-fast-gateway:latest
 ```
 

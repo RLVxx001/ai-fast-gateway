@@ -62,17 +62,6 @@ func (p *proxyServer) serveClaudeMessagesViaResponsesWS(w http.ResponseWriter, r
 		http.Error(w, "invalid anthropic json", http.StatusBadRequest)
 		return true
 	}
-	upstreamConn, upstreamReader, err := p.openBridgeWebSocket(r)
-	if err != nil {
-		log.Printf("cc ws bridge upstream connect failed: path=%s model=%q err=%v", r.URL.RequestURI(), req.Model, err)
-		if p.cfg.ccWSBridgeFallback {
-			return false
-		}
-		http.Error(w, "cc websocket bridge upstream connect failed", http.StatusBadGateway)
-		return true
-	}
-	defer upstreamConn.Close()
-
 	responseReq, err := translateClaudeToResponses(req, r.Header.Get("x-claude-code-session-id"))
 	if err != nil {
 		log.Printf("cc ws bridge translate request failed: model=%q err=%v", req.Model, err)
@@ -97,7 +86,21 @@ func (p *proxyServer) serveClaudeMessagesViaResponsesWS(w http.ResponseWriter, r
 		http.Error(w, "cc websocket bridge encode request failed", http.StatusInternalServerError)
 		return true
 	}
-	if err := writeWSFrame(upstreamConn, wsFrame{fin: true, opcode: 1, payload: createBytes}, true); err != nil {
+
+	sessionKey := bridgeWSSessionKey(r, responseReq)
+	upstream, err := p.acquireBridgeWebSocket(r, sessionKey)
+	if err != nil {
+		log.Printf("cc ws bridge upstream connect failed: path=%s model=%q err=%v", r.URL.RequestURI(), req.Model, err)
+		if p.cfg.ccWSBridgeFallback {
+			return false
+		}
+		http.Error(w, "cc websocket bridge upstream connect failed", http.StatusBadGateway)
+		return true
+	}
+	defer upstream.Release()
+
+	if err := writeWSFrame(upstream.conn, wsFrame{fin: true, opcode: 1, payload: createBytes}, true); err != nil {
+		upstream.MarkBroken()
 		log.Printf("cc ws bridge write response.create failed: model=%q err=%v", req.Model, err)
 		if p.cfg.ccWSBridgeFallback {
 			return false
@@ -109,11 +112,12 @@ func (p *proxyServer) serveClaudeMessagesViaResponsesWS(w http.ResponseWriter, r
 	if p.cfg.ccWSBridgeDebug || p.cfg.wsDebugPayloadBytes > 0 {
 		logWebSocketJSONSummary("cc ws bridge outbound response.create", r.URL.RequestURI(), createBytes, p.cfg.wsDebugPayloadBytes)
 	}
-	log.Printf("cc ws bridge started: path=%s upstream_path=%s model=%q request_bytes=%d",
-		r.URL.RequestURI(), p.cfg.ccWSBridgePath, req.Model, len(createBytes))
+	log.Printf("cc ws bridge started: path=%s upstream_path=%s model=%q request_bytes=%d conn_id=%s conn_reused=%v pool_mode=%s session_key=%s",
+		r.URL.RequestURI(), p.cfg.ccWSBridgePath, req.Model, len(createBytes), upstream.id, upstream.reused, p.cfg.ccWSPoolMode, truncateLogValue(sessionKey, 16))
 
-	firstFrame, err := readFirstBridgeTextFrame(upstreamConn, upstreamReader, p.cfg.ccWSFirstEventWait, p.cfg.ccWSBridgeDebug)
+	firstFrame, err := readFirstBridgeTextFrame(upstream.conn, upstream.reader, p.cfg.ccWSFirstEventWait, p.cfg.ccWSBridgeDebug)
 	if err != nil {
+		upstream.MarkBroken()
 		log.Printf("cc ws bridge first event wait failed: path=%s model=%q wait=%s err=%v",
 			r.URL.RequestURI(), req.Model, p.cfg.ccWSFirstEventWait, err)
 		if p.cfg.ccWSBridgeFallback {
@@ -124,8 +128,9 @@ func (p *proxyServer) serveClaudeMessagesViaResponsesWS(w http.ResponseWriter, r
 	}
 
 	if !req.Stream {
-		message, err := collectResponsesWebSocketToAnthropicMessage(upstreamConn, upstreamReader, req.Model, p.cfg.ccWSBridgeDebug, firstFrame)
+		message, err := collectResponsesWebSocketToAnthropicMessage(upstream.conn, upstream.reader, req.Model, p.cfg.ccWSBridgeDebug, firstFrame)
 		if err != nil {
+			upstream.MarkBroken()
 			log.Printf("cc ws bridge non-stream collect failed: path=%s model=%q err=%v", r.URL.RequestURI(), req.Model, err)
 			http.Error(w, "cc websocket bridge collect failed", http.StatusBadGateway)
 			return true
@@ -144,7 +149,9 @@ func (p *proxyServer) serveClaudeMessagesViaResponsesWS(w http.ResponseWriter, r
 	header.Set("Connection", "keep-alive")
 	header.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
-	_ = translateResponsesWebSocketToAnthropicSSE(w, upstreamConn, upstreamReader, req.Model, p.cfg.ccWSBridgeDebug, firstFrame)
+	if err := translateResponsesWebSocketToAnthropicSSE(w, upstream.conn, upstream.reader, req.Model, p.cfg.ccWSBridgeDebug, firstFrame); err != nil {
+		upstream.MarkBroken()
+	}
 	return true
 }
 

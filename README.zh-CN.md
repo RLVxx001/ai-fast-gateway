@@ -1,11 +1,12 @@
 # AI Fast Gateway 中文说明
 
-AI Fast Gateway 是一个轻量级 HTTP/WebSocket 中转网关，用来把 Codex、Claude Code、ccswitch 等客户端请求转发到上游服务，同时强制补齐 fast mode 相关参数。
+AI Fast Gateway 是一个轻量级 HTTP/WebSocket 中转网关，用来把 Codex、Claude Code、ccswitch 等客户端请求转发到上游服务，同时强制补齐 fast mode 相关参数。它还可以把 Claude Code 的 `/v1/messages` 请求转换成上游 `/responses` WebSocket 请求，用于让原本走 Anthropic Messages/SSE 的 Claude Code 链路接入支持 Responses WebSocket 的上游。
 
-它适合放在客户端和 sub2api / OpenAI 兼容服务之间：
+它适合放在客户端和 sub2api / OpenAI 兼容服务之间，既可以做普通 HTTP/SSE fast 参数注入，也可以在需要时做 Claude Code 到 Responses WebSocket 的桥接：
 
 ```text
 Codex / Claude Code / ccswitch -> ai-fast-gateway -> sub2api / upstream
+Claude Code /v1/messages -> ai-fast-gateway -> upstream /responses WebSocket
 ```
 
 ## 功能
@@ -134,4 +135,3 @@ CC_WS_BRIDGE_ENABLED=true
 - 如果上游账号返回 usage limit、quota exhausted、429 等错误，是否自动换号取决于 sub2api 或上游服务本身。
 - 不建议把真实上游地址、API key、OAuth token 写死进仓库，使用环境变量注入。
 - 日志建议输出到 stdout，再交给 Docker log rotation 控制大小。
-

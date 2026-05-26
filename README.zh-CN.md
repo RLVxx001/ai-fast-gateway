@@ -57,6 +57,9 @@ go build -o ai-fast-gateway .
 LISTEN_ADDR=127.0.0.1:18317
 UPSTREAM_URL=http://127.0.0.1:8080
 LOG_FILE=./ai-fast-gateway.log
+LOG_MAX_SIZE_MB=20
+LOG_MAX_BACKUPS=5
+LOG_ROTATE_INTERVAL_MINUTES=0
 ```
 
 自定义上游：
@@ -88,18 +91,38 @@ docker run -d \
   --name ai-fast-gateway \
   --network sub2api_sub2api-network \
   -p 8317:8317 \
+  -v /opt/ai-fast-gateway/logs:/logs \
   -e LISTEN_ADDR=:8317 \
   -e UPSTREAM_URL=http://sub2api:8080 \
-  -e LOG_FILE=stdout \
+  -e LOG_FILE=/logs/ai-fast-gateway.log \
+  -e LOG_MAX_SIZE_MB=20 \
+  -e LOG_MAX_BACKUPS=5 \
+  -e LOG_ROTATE_INTERVAL_MINUTES=0 \
   -e MAX_IDLE_CONNS=256 \
   -e MAX_IDLE_CONNS_PER_HOST=256 \
   -e CC_WS_BRIDGE_ENABLED=false \
-  --log-opt max-size=20m \
-  --log-opt max-file=3 \
   ghcr.io/your-org/ai-fast-gateway:latest
 ```
 
 这里的 `http://sub2api:8080` 是 Docker 内部网络地址，不是宿主机暴露出来的外部端口。
+
+日志会同时输出到 Docker stdout 和 `LOG_FILE` 指定的文件。上面的 `-v /opt/ai-fast-gateway/logs:/logs` 会把容器内日志目录映射到服务器 `/opt/ai-fast-gateway/logs`，便于下载和排查。
+
+日志轮转规则：
+
+```text
+LOG_MAX_SIZE_MB=20              # 单个日志超过 20MB 后切分；设为 0 可关闭按大小切分
+LOG_MAX_BACKUPS=5               # 最多保留 5 个历史日志；设为 0 表示不自动删除历史日志
+LOG_ROTATE_INTERVAL_MINUTES=0   # 按分钟定时切分；0 表示关闭。比如 60 表示每小时切一次
+```
+
+切分后的文件名类似：
+
+```text
+ai-fast-gateway.log
+ai-fast-gateway-20260526-173538.log
+ai-fast-gateway-20260526-180000.log
+```
 
 ## 常用环境变量
 
@@ -107,6 +130,9 @@ docker run -d \
 LISTEN_ADDR=:8317
 UPSTREAM_URL=http://127.0.0.1:8080
 LOG_FILE=stdout
+LOG_MAX_SIZE_MB=20
+LOG_MAX_BACKUPS=5
+LOG_ROTATE_INTERVAL_MINUTES=0
 MAX_IDLE_CONNS=100
 MAX_IDLE_CONNS_PER_HOST=100
 CC_WS_BRIDGE_ENABLED=false
@@ -134,4 +160,4 @@ CC_WS_BRIDGE_ENABLED=true
 - 网关只负责中转和补参数，不负责账号额度、账号池调度或上游重试。
 - 如果上游账号返回 usage limit、quota exhausted、429 等错误，是否自动换号取决于 sub2api 或上游服务本身。
 - 不建议把真实上游地址、API key、OAuth token 写死进仓库，使用环境变量注入。
-- 日志建议输出到 stdout，再交给 Docker log rotation 控制大小。
+- 如果用文件日志，建议把容器内 `/logs` 映射到服务器目录，并配置 `LOG_MAX_SIZE_MB` 和 `LOG_MAX_BACKUPS` 控制大小。

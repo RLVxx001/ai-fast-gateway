@@ -62,6 +62,9 @@ The start script uses:
 LISTEN_ADDR=127.0.0.1:18317
 UPSTREAM_URL=http://127.0.0.1:8080
 LOG_FILE=./ai-fast-gateway.log
+LOG_MAX_SIZE_MB=20
+LOG_MAX_BACKUPS=5
+LOG_ROTATE_INTERVAL_MINUTES=0
 ```
 
 Override example:
@@ -78,6 +81,9 @@ Useful environment variables and flags:
 -listen   listen address, default :8317
 -upstream upstream base URL, default http://127.0.0.1:8080
 -log-file log file path, default is ai-fast-gateway.log next to the executable
+LOG_MAX_SIZE_MB=20
+LOG_MAX_BACKUPS=5
+LOG_ROTATE_INTERVAL_MINUTES=0
 MAX_IDLE_CONNS=100
 MAX_IDLE_CONNS_PER_HOST=100
 CC_WS_BRIDGE_ENABLED=false
@@ -102,14 +108,21 @@ The upstream target is configurable with `UPSTREAM_URL`:
 ```bash
 docker run -d \
   --name ai-fast-gateway \
+  --network sub2api_sub2api-network \
   -p 8317:8317 \
+  -v /opt/ai-fast-gateway/logs:/logs \
   -e LISTEN_ADDR=:8317 \
   -e UPSTREAM_URL=http://sub2api:8080 \
-  -e LOG_FILE=stdout \
+  -e LOG_FILE=/logs/ai-fast-gateway.log \
+  -e LOG_MAX_SIZE_MB=20 \
+  -e LOG_MAX_BACKUPS=5 \
+  -e LOG_ROTATE_INTERVAL_MINUTES=0 \
   -e MAX_IDLE_CONNS=256 \
   -e MAX_IDLE_CONNS_PER_HOST=256 \
   -e CC_WS_BRIDGE_ENABLED=false \
-  --log-opt max-size=20m \
-  --log-opt max-file=3 \
   ghcr.io/your-org/ai-fast-gateway:latest
 ```
+
+Logs are written to Docker stdout and to `LOG_FILE` when `LOG_FILE` is not `stdout`.
+Mount `/logs` to a host directory when using file logs. Rotated files are named like
+`ai-fast-gateway-20260526-173538.log`.

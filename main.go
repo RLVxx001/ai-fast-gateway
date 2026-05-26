@@ -38,6 +38,9 @@ type config struct {
 	listenAddr          string
 	upstream            *url.URL
 	logFile             string
+	logMaxSizeMB        int
+	logMaxBackups       int
+	logRotateInterval   time.Duration
 	maxIdleConns        int
 	maxIdleConnsPerHost int
 	ccWSBridgeEnabled   bool
@@ -101,6 +104,9 @@ func loadConfig() (config, error) {
 	listenAddr := flag.String("listen", envOrDefault("LISTEN_ADDR", defaultListenAddr), "listen address, for example :8317 or 127.0.0.1:8317")
 	upstreamRaw := flag.String("upstream", envOrDefault("UPSTREAM_URL", defaultUpstreamURL), "upstream base URL")
 	logFile := flag.String("log-file", envOrDefault("LOG_FILE", defaultLogFile()), "log file path")
+	logMaxSizeMB := flag.Int("log-max-size-mb", envIntOrDefault("LOG_MAX_SIZE_MB", 20), "maximum log file size in MB before rotation, 0 disables size rotation")
+	logMaxBackups := flag.Int("log-max-backups", envIntOrDefault("LOG_MAX_BACKUPS", 5), "maximum rotated log files to keep, 0 keeps all")
+	logRotateIntervalMinutes := flag.Int("log-rotate-interval-minutes", envIntOrDefault("LOG_ROTATE_INTERVAL_MINUTES", 0), "rotate log file every N minutes, 0 disables interval rotation")
 	maxIdleConns := flag.Int("max-idle-conns", envIntOrDefault("MAX_IDLE_CONNS", 100), "maximum idle upstream connections across all hosts")
 	maxIdleConnsPerHost := flag.Int("max-idle-conns-per-host", envIntOrDefault("MAX_IDLE_CONNS_PER_HOST", 100), "maximum idle upstream connections per host")
 	ccWSBridgeEnabled := flag.Bool("cc-ws-bridge-enabled", envBoolOrDefault("CC_WS_BRIDGE_ENABLED", false), "bridge Claude Code /v1/messages to upstream /responses WebSocket")
@@ -122,6 +128,9 @@ func loadConfig() (config, error) {
 		listenAddr:          strings.TrimSpace(*listenAddr),
 		upstream:            upstream,
 		logFile:             strings.TrimSpace(*logFile),
+		logMaxSizeMB:        maxInt(*logMaxSizeMB, 0),
+		logMaxBackups:       maxInt(*logMaxBackups, 0),
+		logRotateInterval:   time.Duration(maxInt(*logRotateIntervalMinutes, 0)) * time.Minute,
 		maxIdleConns:        positiveOrDefault(*maxIdleConns, 100),
 		maxIdleConnsPerHost: positiveOrDefault(*maxIdleConnsPerHost, 100),
 		ccWSBridgeEnabled:   *ccWSBridgeEnabled,
@@ -151,16 +160,14 @@ func configureLogger(cfg config) error {
 	if cfg.logFile == "" {
 		cfg.logFile = defaultLogFile()
 	}
-	if err := os.MkdirAll(filepath.Dir(cfg.logFile), 0755); err != nil {
-		return err
-	}
-	file, err := os.OpenFile(cfg.logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	writer, err := newRotatingLogWriter(cfg.logFile, cfg.logMaxSizeMB, cfg.logMaxBackups, cfg.logRotateInterval)
 	if err != nil {
 		return err
 	}
-	log.SetOutput(io.MultiWriter(os.Stdout, file))
+	log.SetOutput(io.MultiWriter(os.Stdout, writer))
 	log.SetFlags(log.LstdFlags)
-	log.Printf("log_file=%s", cfg.logFile)
+	log.Printf("log_file=%s max_size_mb=%d max_backups=%d rotate_interval=%s",
+		cfg.logFile, cfg.logMaxSizeMB, cfg.logMaxBackups, cfg.logRotateInterval)
 	return nil
 }
 

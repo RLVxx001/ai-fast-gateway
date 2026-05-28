@@ -53,9 +53,10 @@ type bridgeBlockState struct {
 }
 
 func (p *proxyServer) serveClaudeMessagesViaResponsesWS(w http.ResponseWriter, r *http.Request, body []byte) bool {
+	cfg := p.currentConfig()
 	var req claudeBridgeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		if p.cfg.ccWSBridgeFallback {
+		if cfg.ccWSBridgeFallback {
 			log.Printf("cc ws bridge fallback: invalid anthropic json: %v", err)
 			return false
 		}
@@ -65,7 +66,7 @@ func (p *proxyServer) serveClaudeMessagesViaResponsesWS(w http.ResponseWriter, r
 	responseReq, err := translateClaudeToResponses(req, r.Header.Get("x-claude-code-session-id"))
 	if err != nil {
 		log.Printf("cc ws bridge translate request failed: model=%q err=%v", req.Model, err)
-		if p.cfg.ccWSBridgeFallback {
+		if cfg.ccWSBridgeFallback {
 			return false
 		}
 		http.Error(w, "cc websocket bridge translate request failed", http.StatusBadRequest)
@@ -78,7 +79,8 @@ func (p *proxyServer) serveClaudeMessagesViaResponsesWS(w http.ResponseWriter, r
 	}
 	createEvent["type"] = "response.create"
 	normalizeResponsesWebSocketCreate(createEvent)
-	if clientMetadata := bridgeClientMetadata(r); len(clientMetadata) > 0 {
+	sessionKey := bridgeWSSessionKey(r, responseReq)
+	if clientMetadata := bridgeClientMetadataForSession(r, sessionKey); len(clientMetadata) > 0 {
 		createEvent["client_metadata"] = clientMetadata
 	}
 	createBytes, err := json.Marshal(createEvent)
@@ -86,49 +88,26 @@ func (p *proxyServer) serveClaudeMessagesViaResponsesWS(w http.ResponseWriter, r
 		http.Error(w, "cc websocket bridge encode request failed", http.StatusInternalServerError)
 		return true
 	}
+	if cfg.ccWSBridgeMaxRequestBytes > 0 && len(createBytes) > cfg.ccWSBridgeMaxRequestBytes {
+		log.Printf("cc ws bridge skipped: path=%s model=%q request_bytes=%d max_request_bytes=%d reason=large_request",
+			r.URL.RequestURI(), req.Model, len(createBytes), cfg.ccWSBridgeMaxRequestBytes)
+		return false
+	}
 
-	sessionKey := bridgeWSSessionKey(r, responseReq)
-	upstream, err := p.acquireBridgeWebSocket(r, sessionKey)
+	upstream, firstFrame, err := p.startClaudeResponsesWSBridge(r, req.Model, createBytes, sessionKey)
 	if err != nil {
-		log.Printf("cc ws bridge upstream connect failed: path=%s model=%q err=%v", r.URL.RequestURI(), req.Model, err)
-		if p.cfg.ccWSBridgeFallback {
+		log.Printf("cc ws bridge attempts exhausted: path=%s model=%q attempts=%d err=%v",
+			r.URL.RequestURI(), req.Model, positiveOrDefault(cfg.ccWSBridgeMaxAttempts, 5), err)
+		if cfg.ccWSBridgeFallback {
 			return false
 		}
-		http.Error(w, "cc websocket bridge upstream connect failed", http.StatusBadGateway)
+		http.Error(w, "cc websocket bridge upstream failed", http.StatusBadGateway)
 		return true
 	}
 	defer upstream.Release()
 
-	if err := writeWSFrame(upstream.conn, wsFrame{fin: true, opcode: 1, payload: createBytes}, true); err != nil {
-		upstream.MarkBroken()
-		log.Printf("cc ws bridge write response.create failed: model=%q err=%v", req.Model, err)
-		if p.cfg.ccWSBridgeFallback {
-			return false
-		}
-		http.Error(w, "cc websocket bridge write request failed", http.StatusBadGateway)
-		return true
-	}
-
-	if p.cfg.ccWSBridgeDebug || p.cfg.wsDebugPayloadBytes > 0 {
-		logWebSocketJSONSummary("cc ws bridge outbound response.create", r.URL.RequestURI(), createBytes, p.cfg.wsDebugPayloadBytes)
-	}
-	log.Printf("cc ws bridge started: path=%s upstream_path=%s model=%q request_bytes=%d conn_id=%s conn_reused=%v pool_mode=%s session_key=%s",
-		r.URL.RequestURI(), p.cfg.ccWSBridgePath, req.Model, len(createBytes), upstream.id, upstream.reused, p.cfg.ccWSPoolMode, truncateLogValue(sessionKey, 16))
-
-	firstFrame, err := readFirstBridgeTextFrame(upstream.conn, upstream.reader, p.cfg.ccWSFirstEventWait, p.cfg.ccWSBridgeDebug)
-	if err != nil {
-		upstream.MarkBroken()
-		log.Printf("cc ws bridge first event wait failed: path=%s model=%q wait=%s err=%v",
-			r.URL.RequestURI(), req.Model, p.cfg.ccWSFirstEventWait, err)
-		if p.cfg.ccWSBridgeFallback {
-			return false
-		}
-		http.Error(w, "cc websocket bridge first event timeout", http.StatusBadGateway)
-		return true
-	}
-
 	if !req.Stream {
-		message, err := collectResponsesWebSocketToAnthropicMessage(upstream.conn, upstream.reader, req.Model, p.cfg.ccWSBridgeDebug, firstFrame)
+		message, err := collectResponsesWebSocketToAnthropicMessage(upstream.conn, upstream.reader, req.Model, cfg.ccWSBridgeDebug, firstFrame)
 		if err != nil {
 			upstream.MarkBroken()
 			log.Printf("cc ws bridge non-stream collect failed: path=%s model=%q err=%v", r.URL.RequestURI(), req.Model, err)
@@ -149,15 +128,167 @@ func (p *proxyServer) serveClaudeMessagesViaResponsesWS(w http.ResponseWriter, r
 	header.Set("Connection", "keep-alive")
 	header.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
-	if err := translateResponsesWebSocketToAnthropicSSE(w, upstream.conn, upstream.reader, req.Model, p.cfg.ccWSBridgeDebug, firstFrame); err != nil {
+	if err := translateResponsesWebSocketToAnthropicSSE(w, upstream.conn, upstream.reader, req.Model, cfg.ccWSBridgeDebug, firstFrame); err != nil {
 		upstream.MarkBroken()
 	}
 	return true
 }
 
+type bridgeFirstEventError struct {
+	err error
+}
+
+func (e bridgeFirstEventError) Error() string {
+	return e.err.Error()
+}
+
+func (e bridgeFirstEventError) Unwrap() error {
+	return e.err
+}
+
+func isBridgeFirstEventFailure(err error) bool {
+	var firstEventErr bridgeFirstEventError
+	return errors.As(err, &firstEventErr)
+}
+
+func (p *proxyServer) effectiveBridgeSession(clientKey string, originalSession string) string {
+	if p.sessionRotator == nil {
+		p.sessionRotator = newBridgeSessionRotator(p.currentConfig())
+	}
+	return p.sessionRotator.effectiveSession(clientKey, originalSession)
+}
+
+func (p *proxyServer) markBridgeSessionSuccess(clientKey string, originalSession string) {
+	if p.sessionRotator == nil {
+		return
+	}
+	p.sessionRotator.markSuccess(clientKey, originalSession)
+}
+
+func (p *proxyServer) markBridgeSessionFirstEventFailure(clientKey string, originalSession string, err error) {
+	if p.sessionRotator == nil {
+		p.sessionRotator = newBridgeSessionRotator(p.currentConfig())
+	}
+	p.sessionRotator.markFirstEventFailure(clientKey, originalSession, err)
+}
+
+func (p *proxyServer) startClaudeResponsesWSBridge(r *http.Request, model string, createBytes []byte, sessionKey string) (*bridgeWSLease, []byte, error) {
+	cfg := p.currentConfig()
+	maxAttempts := positiveOrDefault(cfg.ccWSBridgeMaxAttempts, 5)
+	clientKey := bridgeWSClientKey(r)
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		effectiveSessionKey := p.effectiveBridgeSession(clientKey, sessionKey)
+		attemptCreateBytes, err := rewriteBridgeCreateSession(createBytes, effectiveSessionKey)
+		if err != nil {
+			return nil, nil, err
+		}
+		upstream, firstFrame, err := p.tryStartClaudeResponsesWSBridge(r, model, attemptCreateBytes, effectiveSessionKey, attempt, maxAttempts)
+		if err == nil {
+			p.markBridgeSessionSuccess(clientKey, sessionKey)
+			return upstream, firstFrame, nil
+		}
+		lastErr = err
+		if isBridgeFirstEventFailure(err) {
+			p.markBridgeSessionFirstEventFailure(clientKey, sessionKey, err)
+		}
+		if attempt < maxAttempts {
+			log.Printf("cc ws bridge retrying: path=%s model=%q attempt=%d/%d err=%v",
+				r.URL.RequestURI(), model, attempt+1, maxAttempts, err)
+		}
+	}
+	return nil, nil, lastErr
+}
+
+func rewriteBridgeCreateSession(createBytes []byte, sessionKey string) ([]byte, error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" || sessionKey == "default" || sessionKey == "responses" {
+		return createBytes, nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(createBytes, &payload); err != nil {
+		return nil, err
+	}
+	payload["prompt_cache_key"] = sessionKey
+	payload["client_metadata"] = rewriteBridgeClientMetadataSession(payload["client_metadata"], sessionKey)
+	return json.Marshal(payload)
+}
+
+func rewriteBridgeClientMetadataSession(raw any, sessionKey string) map[string]string {
+	metadata := map[string]string{}
+	if existing, ok := raw.(map[string]any); ok {
+		for key, value := range existing {
+			if text, ok := value.(string); ok {
+				metadata[key] = text
+			}
+		}
+	}
+	if existing, ok := raw.(map[string]string); ok {
+		for key, value := range existing {
+			metadata[key] = value
+		}
+	}
+	if sessionKey != "default" && sessionKey != "responses" {
+		metadata["x-claude-code-session-id"] = sessionKey
+		metadata["x-codex-session-id"] = sessionKey
+		metadata["x-codex-window-id"] = sessionKey + ":0"
+		metadata["x-codex-turn-metadata"] = `{"session_id":"` + sessionKey + `","thread_id":"` + sessionKey + `","thread_source":"claude-code-bridge"}`
+	}
+	return metadata
+}
+
+func bridgeRequestWithSession(r *http.Request, sessionKey string) *http.Request {
+	if strings.TrimSpace(sessionKey) == "" || strings.TrimSpace(sessionKey) == "default" || strings.TrimSpace(sessionKey) == "responses" {
+		return r
+	}
+	cloned := r.Clone(r.Context())
+	cloned.Header = r.Header.Clone()
+	cloned.Header.Set("x-claude-code-session-id", sessionKey)
+	cloned.Header.Set("x-codex-session-id", sessionKey)
+	cloned.Header.Set("x-codex-window-id", sessionKey+":0")
+	cloned.Header.Set("x-codex-turn-metadata", `{"session_id":"`+sessionKey+`","thread_id":"`+sessionKey+`","thread_source":"claude-code-bridge"}`)
+	return cloned
+}
+
+func (p *proxyServer) tryStartClaudeResponsesWSBridge(r *http.Request, model string, createBytes []byte, sessionKey string, attempt int, maxAttempts int) (*bridgeWSLease, []byte, error) {
+	cfg := p.currentConfig()
+	upstream, err := p.acquireBridgeWebSocket(bridgeRequestWithSession(r, sessionKey), sessionKey)
+	if err != nil {
+		log.Printf("cc ws bridge upstream connect failed: path=%s model=%q attempt=%d/%d err=%v",
+			r.URL.RequestURI(), model, attempt, maxAttempts, err)
+		return nil, nil, err
+	}
+
+	if err := writeWSFrame(upstream.conn, wsFrame{fin: true, opcode: 1, payload: createBytes}, true); err != nil {
+		upstream.MarkBroken()
+		upstream.Release()
+		log.Printf("cc ws bridge write response.create failed: path=%s model=%q attempt=%d/%d err=%v",
+			r.URL.RequestURI(), model, attempt, maxAttempts, err)
+		return nil, nil, err
+	}
+
+	if cfg.ccWSBridgeDebug || cfg.wsDebugPayloadBytes > 0 {
+		logWebSocketJSONSummary("cc ws bridge outbound response.create", r.URL.RequestURI(), createBytes, cfg.wsDebugPayloadBytes)
+	}
+	log.Printf("cc ws bridge started: path=%s upstream_path=%s model=%q request_bytes=%d conn_id=%s conn_reused=%v pool_mode=%s session_key=%s attempt=%d/%d",
+		r.URL.RequestURI(), cfg.ccWSBridgePath, model, len(createBytes), upstream.id, upstream.reused, cfg.ccWSPoolMode, truncateLogValue(sessionKey, 16), attempt, maxAttempts)
+
+	firstFrame, err := readFirstBridgeTextFrame(upstream.conn, upstream.reader, cfg.ccWSFirstEventWait, cfg.ccWSBridgeDebug)
+	if err != nil {
+		upstream.MarkBroken()
+		upstream.Release()
+		log.Printf("cc ws bridge first event wait failed: path=%s model=%q wait=%s attempt=%d/%d err=%v",
+			r.URL.RequestURI(), model, cfg.ccWSFirstEventWait, attempt, maxAttempts, err)
+		return nil, nil, bridgeFirstEventError{err: err}
+	}
+
+	return upstream, firstFrame, nil
+}
+
 func (p *proxyServer) openBridgeWebSocket(in *http.Request) (net.Conn, *bufio.Reader, error) {
-	target := *p.cfg.upstream
-	target.Path = joinURLPath(target.Path, p.cfg.ccWSBridgePath)
+	cfg := p.currentConfig()
+	target := *cfg.upstream
+	target.Path = joinURLPath(target.Path, cfg.ccWSBridgePath)
 	target.RawQuery = ""
 
 	hostPort := hostWithDefaultPort(&target)
@@ -185,7 +316,7 @@ func (p *proxyServer) openBridgeWebSocket(in *http.Request) (net.Conn, *bufio.Re
 		Proto:      "HTTP/1.1",
 		ProtoMajor: 1,
 		ProtoMinor: 1,
-		Host:       p.cfg.upstream.Host,
+		Host:       cfg.upstream.Host,
 		Header:     make(http.Header),
 	}
 	copyBridgeHeaders(outReq.Header, in.Header)
@@ -225,6 +356,10 @@ func (p *proxyServer) openBridgeWebSocket(in *http.Request) (net.Conn, *bufio.Re
 }
 
 func bridgeClientMetadata(r *http.Request) map[string]string {
+	return bridgeClientMetadataForSession(r, r.Header.Get("x-claude-code-session-id"))
+}
+
+func bridgeClientMetadataForSession(r *http.Request, sessionID string) map[string]string {
 	metadata := map[string]string{}
 	for key, values := range r.Header {
 		lower := strings.ToLower(key)
@@ -235,7 +370,9 @@ func bridgeClientMetadata(r *http.Request) map[string]string {
 			metadata[strings.ToLower(key)] = values[0]
 		}
 	}
-	if sessionID := r.Header.Get("x-claude-code-session-id"); sessionID != "" {
+	if sessionID = strings.TrimSpace(sessionID); sessionID != "" && sessionID != "default" && sessionID != "responses" {
+		metadata["x-claude-code-session-id"] = sessionID
+		metadata["x-codex-session-id"] = sessionID
 		metadata["x-codex-window-id"] = sessionID + ":0"
 		metadata["x-codex-turn-metadata"] = `{"session_id":"` + sessionID + `","thread_id":"` + sessionID + `","thread_source":"claude-code-bridge"}`
 	}

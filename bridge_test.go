@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -233,6 +234,76 @@ func TestClaudeWSBridgeHandlesNonStreamRequest(t *testing.T) {
 	}
 }
 
+func TestClaudeWSBridgeRetriesBeforeFirstEvent(t *testing.T) {
+	var attempts int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := atomic.AddInt32(&attempts, 1)
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		accept := websocketAccept(r.Header.Get("Sec-WebSocket-Key"))
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"))
+		if _, err := readWSFrame(rw.Reader); err != nil {
+			t.Errorf("read create frame: %v", err)
+			return
+		}
+		if attempt < 3 {
+			return
+		}
+		events := []string{
+			`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message"}}`,
+			`{"type":"response.output_text.delta","output_index":0,"delta":"retried"}`,
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}`,
+			`{"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":2}}}`,
+		}
+		for _, event := range events {
+			if err := writeWSFrame(conn, wsFrame{fin: true, opcode: 1, payload: []byte(event)}, false); err != nil {
+				t.Errorf("write event: %v", err)
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(&proxyServer{cfg: config{
+		upstream:              upstreamURL,
+		ccWSBridgeEnabled:     true,
+		ccWSBridgePath:        "/responses",
+		ccWSBridgeFallback:    false,
+		ccWSFirstEventWait:    time.Second,
+		ccWSBridgeMaxAttempts: 3,
+		ccWSPoolMode:          "request",
+	}})
+	defer proxy.Close()
+
+	body := `{"model":"gpt-5.5","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	resp, err := http.Post(proxy.URL+"/v1/messages?beta=true", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	buf, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, buf)
+	}
+	if !strings.Contains(string(buf), `"text":"retried"`) {
+		t.Fatalf("response did not contain retried text: %s", buf)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Fatalf("attempts = %d, want 3", got)
+	}
+}
+
 func TestClaudeWSBridgeClientPoolReusesConnectionSerially(t *testing.T) {
 	handshakes := make(chan struct{}, 2)
 	upstreamCreates := make(chan map[string]any, 2)
@@ -327,5 +398,270 @@ func TestClaudeWSBridgeClientPoolReusesConnectionSerially(t *testing.T) {
 	case <-handshakes:
 		t.Fatal("expected pooled websocket to be reused without second handshake")
 	default:
+	}
+}
+
+func TestOpenAIResponsesHTTPBridgeStreamsViaWebSocket(t *testing.T) {
+	upstreamCreate := make(chan map[string]any, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		accept := websocketAccept(r.Header.Get("Sec-WebSocket-Key"))
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"))
+
+		frame, err := readWSFrame(rw.Reader)
+		if err != nil {
+			t.Errorf("read create frame: %v", err)
+			return
+		}
+		var create map[string]any
+		if err := json.Unmarshal(frame.payload, &create); err != nil {
+			t.Errorf("decode create frame: %v", err)
+			return
+		}
+		upstreamCreate <- create
+
+		events := []string{
+			`{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+			`{"type":"response.output_text.delta","delta":"hello"}`,
+			`{"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`,
+		}
+		for _, event := range events {
+			if err := writeWSFrame(conn, wsFrame{fin: true, opcode: 1, payload: []byte(event)}, false); err != nil {
+				t.Errorf("write event: %v", err)
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(&proxyServer{
+		cfg: config{
+			upstream:              upstreamURL,
+			ccWSBridgePath:        "/responses",
+			ccWSBridgeMaxAttempts: 1,
+			openAIResponsesWS:     true,
+			ccWSPoolMode:          "request",
+			ccWSFirstEventWait:    3 * time.Second,
+		},
+	})
+	defer proxy.Close()
+
+	body := `{"model":"gpt-5.5","stream":true,"input":"hi","prompt_cache_key":"session-1"}`
+	resp, err := http.Post(proxy.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	buf, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(buf)
+	for _, want := range []string{"event: response.created", "event: response.output_text.delta", "event: response.completed"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("response did not contain %q:\n%s", want, got)
+		}
+	}
+	select {
+	case create := <-upstreamCreate:
+		if create["type"] != "response.create" {
+			t.Fatalf("create type = %v", create["type"])
+		}
+		if create["model"] != "gpt-5.5" {
+			t.Fatalf("create model = %v", create["model"])
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for create frame")
+	}
+}
+
+func TestOpenAIResponsesWSBridgeRotatesSessionAfterFirstEventFailures(t *testing.T) {
+	var attempts atomic.Int32
+	seenSessions := make(chan string, 3)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		accept := websocketAccept(r.Header.Get("Sec-WebSocket-Key"))
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"))
+		frame, err := readWSFrame(rw.Reader)
+		if err != nil {
+			t.Errorf("read create frame: %v", err)
+			return
+		}
+		var create map[string]any
+		if err := json.Unmarshal(frame.payload, &create); err != nil {
+			t.Errorf("decode create frame: %v", err)
+			return
+		}
+		seenSessions <- stringOrDefault(create["prompt_cache_key"], "")
+		if attempts.Add(1) < 3 {
+			return
+		}
+		event := `{"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.5"}}`
+		if err := writeWSFrame(conn, wsFrame{fin: true, opcode: 1, payload: []byte(event)}, false); err != nil {
+			t.Errorf("write event: %v", err)
+		}
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(&proxyServer{
+		cfg: config{
+			upstream:                     upstreamURL,
+			ccWSBridgePath:               "/responses",
+			openAIResponsesWS:            true,
+			openAIResponsesWSMaxAttempts: 3,
+			ccWSPoolMode:                 "request",
+			ccWSFirstEventWait:           3 * time.Second,
+			ccWSSessionRotateEnabled:     true,
+			ccWSSessionRotateThreshold:   2,
+		},
+	})
+	defer proxy.Close()
+
+	body := `{"model":"gpt-5.5","stream":false,"input":"hi","prompt_cache_key":"session-1"}`
+	resp, err := http.Post(proxy.URL+"/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, data)
+	}
+
+	first := <-seenSessions
+	second := <-seenSessions
+	third := <-seenSessions
+	if first != "session-1" || second != "session-1" {
+		t.Fatalf("first sessions = %q, %q", first, second)
+	}
+	if !strings.HasPrefix(third, "session-1:wsr") {
+		t.Fatalf("third session was not rotated: %q", third)
+	}
+}
+
+func TestOpenAIResponsesWSBridgeSkipsLargeRequests(t *testing.T) {
+	var sawHTTP atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") == "websocket" {
+			t.Fatalf("large request should not use websocket")
+		}
+		if r.URL.Path != "/responses" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		sawHTTP.Store(true)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_http","status":"completed"}`))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(&proxyServer{
+		cfg: config{
+			upstream:                         upstreamURL,
+			ccWSBridgePath:                   "/responses",
+			openAIResponsesWS:                true,
+			openAIResponsesWSMaxAttempts:     3,
+			openAIResponsesWSMaxRequestBytes: 64,
+			ccWSPoolMode:                     "request",
+			ccWSFirstEventWait:               3 * time.Second,
+		},
+		client: http.DefaultClient,
+	})
+	defer proxy.Close()
+
+	body := `{"model":"gpt-5.5","stream":false,"input":"` + strings.Repeat("x", 200) + `"}`
+	resp, err := http.Post(proxy.URL+"/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, data)
+	}
+	if !sawHTTP.Load() {
+		t.Fatal("upstream HTTP path was not used")
+	}
+}
+
+func TestOpenAIResponsesHTTPBridgeCollectsNonStreamViaWebSocket(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		accept := websocketAccept(r.Header.Get("Sec-WebSocket-Key"))
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"))
+		if _, err := readWSFrame(rw.Reader); err != nil {
+			t.Errorf("read create frame: %v", err)
+			return
+		}
+		event := `{"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5.5"}}`
+		if err := writeWSFrame(conn, wsFrame{fin: true, opcode: 1, payload: []byte(event)}, false); err != nil {
+			t.Errorf("write event: %v", err)
+		}
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(&proxyServer{
+		cfg: config{
+			upstream:              upstreamURL,
+			ccWSBridgePath:        "/responses",
+			ccWSBridgeMaxAttempts: 1,
+			openAIResponsesWS:     true,
+			ccWSPoolMode:          "request",
+			ccWSFirstEventWait:    3 * time.Second,
+		},
+	})
+	defer proxy.Close()
+
+	body := `{"model":"gpt-5.5","stream":false,"input":"hi"}`
+	resp, err := http.Post(proxy.URL+"/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var response map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response["id"] != "resp_1" {
+		t.Fatalf("response id = %v", response["id"])
 	}
 }

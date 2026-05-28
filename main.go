@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	_ "time/tzdata"
 )
@@ -35,25 +36,37 @@ const (
 )
 
 type config struct {
-	listenAddr          string
-	upstream            *url.URL
-	logFile             string
-	logMaxSizeMB        int
-	logMaxBackups       int
-	logRotateInterval   time.Duration
-	maxIdleConns        int
-	maxIdleConnsPerHost int
-	ccWSBridgeEnabled   bool
-	ccWSBridgePath      string
-	ccWSBridgeFallback  bool
-	ccWSBridgeDebug     bool
-	ccWSFirstEventWait  time.Duration
-	wsDebugPayloadBytes int
-	ccWSPoolMode        string
-	ccWSPoolMaxConns    int
-	ccWSPoolMaxIdle     int
-	ccWSPoolIdleTTL     time.Duration
-	ccWSPoolAcquireWait time.Duration
+	listenAddr                       string
+	upstream                         *url.URL
+	logFile                          string
+	logMaxSizeMB                     int
+	logMaxBackups                    int
+	logRotateInterval                time.Duration
+	maxIdleConns                     int
+	maxIdleConnsPerHost              int
+	ccWSBridgeEnabled                bool
+	ccWSBridgePath                   string
+	ccWSBridgeFallback               bool
+	ccWSBridgeDebug                  bool
+	ccWSFirstEventWait               time.Duration
+	ccWSBridgeMaxAttempts            int
+	ccWSBridgeMaxRequestBytes        int
+	ccWSSessionRotateEnabled         bool
+	ccWSSessionRotateThreshold       int
+	ccWSSessionRotateStateFile       string
+	openAIResponsesWS                bool
+	openAIResponsesWSFallback        bool
+	openAIResponsesWSMaxAttempts     int
+	openAIResponsesWSMaxRequestBytes int
+	wsDebugPayloadBytes              int
+	ccWSPoolMode                     string
+	ccWSPoolMaxConns                 int
+	ccWSPoolMaxIdle                  int
+	ccWSPoolIdleTTL                  time.Duration
+	ccWSPoolAcquireWait              time.Duration
+	adminEnabled                     bool
+	adminToken                       string
+	adminPolicyStateFile             string
 }
 
 func main() {
@@ -64,10 +77,13 @@ func main() {
 	if err := configureLogger(cfg); err != nil {
 		log.Fatalf("log setup error: %v", err)
 	}
+	cfg = loadAdminRuntimePolicyOverrides(cfg)
 
 	proxy := &proxyServer{
-		cfg:        cfg,
-		bridgePool: newBridgeWSPoolManager(cfg),
+		cfg:            cfg,
+		bridgePool:     newBridgeWSPoolManager(cfg),
+		sessionRotator: newBridgeSessionRotator(cfg),
+		startedAt:      time.Now(),
 		client: &http.Client{
 			Timeout: 0,
 			Transport: &http.Transport{
@@ -97,9 +113,16 @@ func main() {
 		cfg.listenAddr, cfg.upstream.String(), openAITier, anthropicSpeed, anthropicFastBeta)
 	log.Printf("transport config: max_idle_conns=%d, max_idle_conns_per_host=%d, disable_compression=true",
 		cfg.maxIdleConns, cfg.maxIdleConnsPerHost)
-	log.Printf("cc websocket bridge: enabled=%v, path=%s, fallback_http=%v, debug_frames=%v",
-		cfg.ccWSBridgeEnabled, cfg.ccWSBridgePath, cfg.ccWSBridgeFallback, cfg.ccWSBridgeDebug)
+	log.Printf("cc websocket bridge: enabled=%v, path=%s, fallback_http=%v, debug_frames=%v, max_attempts=%d max_request_bytes=%d",
+		cfg.ccWSBridgeEnabled, cfg.ccWSBridgePath, cfg.ccWSBridgeFallback, cfg.ccWSBridgeDebug, cfg.ccWSBridgeMaxAttempts, cfg.ccWSBridgeMaxRequestBytes)
 	log.Printf("cc websocket bridge timeout: first_event_wait=%s", cfg.ccWSFirstEventWait)
+	log.Printf("cc websocket session rotation: enabled=%v threshold=%d",
+		cfg.ccWSSessionRotateEnabled, cfg.ccWSSessionRotateThreshold)
+	if cfg.ccWSSessionRotateStateFile != "" {
+		log.Printf("cc websocket session rotation state_file=%s", cfg.ccWSSessionRotateStateFile)
+	}
+	log.Printf("openai responses websocket bridge: enabled=%v fallback_http=%v max_attempts=%d max_request_bytes=%d",
+		cfg.openAIResponsesWS, cfg.openAIResponsesWSFallback, cfg.openAIResponsesWSMaxAttempts, cfg.openAIResponsesWSMaxRequestBytes)
 	log.Printf("websocket debug: payload_preview_bytes=%d", cfg.wsDebugPayloadBytes)
 	log.Printf("cc websocket pool: mode=%s max_conns_per_client=%d max_idle_per_client=%d idle_ttl=%s acquire_timeout=%s",
 		cfg.ccWSPoolMode, cfg.ccWSPoolMaxConns, cfg.ccWSPoolMaxIdle, cfg.ccWSPoolIdleTTL, cfg.ccWSPoolAcquireWait)
@@ -122,12 +145,24 @@ func loadConfig() (config, error) {
 	ccWSBridgeFallback := flag.Bool("cc-ws-bridge-fallback-http", envBoolOrDefault("CC_WS_BRIDGE_FALLBACK_HTTP", true), "fall back to normal HTTP proxy when WS bridge fails before streaming")
 	ccWSBridgeDebug := flag.Bool("cc-ws-bridge-debug-frames", envBoolOrDefault("CC_WS_BRIDGE_DEBUG_FRAMES", false), "log upstream WS frame event types for bridge debugging")
 	ccWSFirstEventWaitMS := flag.Int("cc-ws-bridge-first-event-timeout-ms", envIntOrDefault("CC_WS_BRIDGE_FIRST_EVENT_TIMEOUT_MS", 15000), "maximum time to wait for first upstream WS event before fallback")
+	ccWSBridgeMaxAttempts := flag.Int("cc-ws-bridge-max-attempts", envIntOrDefault("CC_WS_BRIDGE_MAX_ATTEMPTS", 5), "maximum upstream WS attempts before HTTP fallback or error")
+	ccWSBridgeMaxRequestBytes := flag.Int("cc-ws-bridge-max-request-bytes", envIntOrDefault("CC_WS_BRIDGE_MAX_REQUEST_BYTES", 0), "skip Claude Code WS bridge when encoded response.create exceeds this many bytes, 0 disables")
+	ccWSSessionRotateEnabled := flag.Bool("cc-ws-session-rotate-enabled", envBoolOrDefault("CC_WS_SESSION_ROTATE_ENABLED", false), "rotate sticky websocket bridge session ids after repeated first-event failures")
+	ccWSSessionRotateThreshold := flag.Int("cc-ws-session-rotate-threshold", envIntOrDefault("CC_WS_SESSION_ROTATE_THRESHOLD", 2), "consecutive first-event failures before rotating a sticky websocket bridge session id")
+	ccWSSessionRotateStateFile := flag.String("cc-ws-session-rotate-state-file", envOrDefault("CC_WS_SESSION_ROTATE_STATE_FILE", ""), "optional JSON file used to persist rotated websocket bridge session ids")
+	openAIResponsesWS := flag.Bool("openai-responses-ws-bridge-enabled", envBoolOrDefault("OPENAI_RESPONSES_WS_BRIDGE_ENABLED", false), "bridge OpenAI POST /responses HTTP requests to upstream /responses WebSocket")
+	openAIResponsesWSFallback := flag.Bool("openai-responses-ws-bridge-fallback-http", envBoolOrDefault("OPENAI_RESPONSES_WS_BRIDGE_FALLBACK_HTTP", true), "fall back to normal HTTP proxy when OpenAI /responses WS bridge fails before streaming")
+	openAIResponsesWSMaxAttempts := flag.Int("openai-responses-ws-bridge-max-attempts", envIntOrDefault("OPENAI_RESPONSES_WS_BRIDGE_MAX_ATTEMPTS", 1), "maximum upstream WS attempts for OpenAI /responses HTTP bridge")
+	openAIResponsesWSMaxRequestBytes := flag.Int("openai-responses-ws-bridge-max-request-bytes", envIntOrDefault("OPENAI_RESPONSES_WS_BRIDGE_MAX_REQUEST_BYTES", 900000), "skip OpenAI /responses WS bridge when encoded response.create exceeds this many bytes, 0 disables")
 	wsDebugPayloadBytes := flag.Int("ws-debug-payload-bytes", envIntOrDefault("WS_DEBUG_PAYLOAD_BYTES", 0), "optional redacted JSON payload preview bytes for websocket debugging")
 	ccWSPoolMode := flag.String("cc-ws-pool-mode", envOrDefault("CC_WS_POOL_MODE", "client"), "upstream WS reuse mode for Claude Code bridge: request or client")
 	ccWSPoolMaxConns := flag.Int("cc-ws-pool-max-conns-per-client", envIntOrDefault("CC_WS_POOL_MAX_CONNS_PER_CLIENT", 20), "maximum reusable upstream WS connections per client")
 	ccWSPoolMaxIdle := flag.Int("cc-ws-pool-max-idle-per-client", envIntOrDefault("CC_WS_POOL_MAX_IDLE_PER_CLIENT", 20), "maximum idle upstream WS connections per client")
 	ccWSPoolIdleTTLSeconds := flag.Int("cc-ws-pool-idle-ttl-seconds", envIntOrDefault("CC_WS_POOL_IDLE_TTL_SECONDS", 600), "close reusable upstream WS connections after this many idle seconds")
 	ccWSPoolAcquireTimeoutMS := flag.Int("cc-ws-pool-acquire-timeout-ms", envIntOrDefault("CC_WS_POOL_ACQUIRE_TIMEOUT_MS", 3000), "maximum time to wait for an available upstream WS connection")
+	adminEnabled := flag.Bool("admin-enabled", envBoolOrDefault("ADMIN_ENABLED", false), "serve the built-in admin console")
+	adminToken := flag.String("admin-token", envOrDefault("ADMIN_TOKEN", ""), "optional bearer token for the built-in admin console")
+	adminPolicyStateFile := flag.String("admin-policy-state-file", envOrDefault("ADMIN_POLICY_STATE_FILE", ""), "optional JSON file used to persist runtime admin policy changes")
 	flag.Parse()
 
 	upstream, err := url.Parse(strings.TrimSpace(*upstreamRaw))
@@ -138,25 +173,37 @@ func loadConfig() (config, error) {
 		return config{}, errors.New("UPSTREAM_URL/upstream must include scheme and host")
 	}
 	return config{
-		listenAddr:          strings.TrimSpace(*listenAddr),
-		upstream:            upstream,
-		logFile:             strings.TrimSpace(*logFile),
-		logMaxSizeMB:        maxInt(*logMaxSizeMB, 0),
-		logMaxBackups:       maxInt(*logMaxBackups, 0),
-		logRotateInterval:   time.Duration(maxInt(*logRotateIntervalMinutes, 0)) * time.Minute,
-		maxIdleConns:        positiveOrDefault(*maxIdleConns, 100),
-		maxIdleConnsPerHost: positiveOrDefault(*maxIdleConnsPerHost, 100),
-		ccWSBridgeEnabled:   *ccWSBridgeEnabled,
-		ccWSBridgePath:      normalizePath(*ccWSBridgePath, "/responses"),
-		ccWSBridgeFallback:  *ccWSBridgeFallback,
-		ccWSBridgeDebug:     *ccWSBridgeDebug,
-		ccWSFirstEventWait:  time.Duration(positiveOrDefault(*ccWSFirstEventWaitMS, 15000)) * time.Millisecond,
-		wsDebugPayloadBytes: maxInt(*wsDebugPayloadBytes, 0),
-		ccWSPoolMode:        normalizeWSPoolMode(*ccWSPoolMode),
-		ccWSPoolMaxConns:    positiveOrDefault(*ccWSPoolMaxConns, 20),
-		ccWSPoolMaxIdle:     maxInt(*ccWSPoolMaxIdle, 0),
-		ccWSPoolIdleTTL:     time.Duration(positiveOrDefault(*ccWSPoolIdleTTLSeconds, 600)) * time.Second,
-		ccWSPoolAcquireWait: time.Duration(positiveOrDefault(*ccWSPoolAcquireTimeoutMS, 3000)) * time.Millisecond,
+		listenAddr:                       strings.TrimSpace(*listenAddr),
+		upstream:                         upstream,
+		logFile:                          strings.TrimSpace(*logFile),
+		logMaxSizeMB:                     maxInt(*logMaxSizeMB, 0),
+		logMaxBackups:                    maxInt(*logMaxBackups, 0),
+		logRotateInterval:                time.Duration(maxInt(*logRotateIntervalMinutes, 0)) * time.Minute,
+		maxIdleConns:                     positiveOrDefault(*maxIdleConns, 100),
+		maxIdleConnsPerHost:              positiveOrDefault(*maxIdleConnsPerHost, 100),
+		ccWSBridgeEnabled:                *ccWSBridgeEnabled,
+		ccWSBridgePath:                   normalizePath(*ccWSBridgePath, "/responses"),
+		ccWSBridgeFallback:               *ccWSBridgeFallback,
+		ccWSBridgeDebug:                  *ccWSBridgeDebug,
+		ccWSFirstEventWait:               time.Duration(positiveOrDefault(*ccWSFirstEventWaitMS, 15000)) * time.Millisecond,
+		ccWSBridgeMaxAttempts:            positiveOrDefault(*ccWSBridgeMaxAttempts, 5),
+		ccWSBridgeMaxRequestBytes:        maxInt(*ccWSBridgeMaxRequestBytes, 0),
+		ccWSSessionRotateEnabled:         *ccWSSessionRotateEnabled,
+		ccWSSessionRotateThreshold:       positiveOrDefault(*ccWSSessionRotateThreshold, 2),
+		ccWSSessionRotateStateFile:       strings.TrimSpace(*ccWSSessionRotateStateFile),
+		openAIResponsesWS:                *openAIResponsesWS,
+		openAIResponsesWSFallback:        *openAIResponsesWSFallback,
+		openAIResponsesWSMaxAttempts:     positiveOrDefault(*openAIResponsesWSMaxAttempts, 1),
+		openAIResponsesWSMaxRequestBytes: maxInt(*openAIResponsesWSMaxRequestBytes, 0),
+		wsDebugPayloadBytes:              maxInt(*wsDebugPayloadBytes, 0),
+		ccWSPoolMode:                     normalizeWSPoolMode(*ccWSPoolMode),
+		ccWSPoolMaxConns:                 positiveOrDefault(*ccWSPoolMaxConns, 20),
+		ccWSPoolMaxIdle:                  maxInt(*ccWSPoolMaxIdle, 0),
+		ccWSPoolIdleTTL:                  time.Duration(positiveOrDefault(*ccWSPoolIdleTTLSeconds, 600)) * time.Second,
+		ccWSPoolAcquireWait:              time.Duration(positiveOrDefault(*ccWSPoolAcquireTimeoutMS, 3000)) * time.Millisecond,
+		adminEnabled:                     *adminEnabled,
+		adminToken:                       strings.TrimSpace(*adminToken),
+		adminPolicyStateFile:             strings.TrimSpace(*adminPolicyStateFile),
 	}, nil
 }
 
@@ -261,12 +308,43 @@ func maxInt(value int, minimum int) int {
 }
 
 type proxyServer struct {
-	cfg        config
-	client     *http.Client
-	bridgePool *bridgeWSPoolManager
+	cfg            config
+	cfgMu          sync.RWMutex
+	client         *http.Client
+	bridgePool     *bridgeWSPoolManager
+	sessionRotator *bridgeSessionRotator
+	startedAt      time.Time
+}
+
+func (p *proxyServer) currentConfig() config {
+	p.cfgMu.RLock()
+	defer p.cfgMu.RUnlock()
+	return p.cfg
+}
+
+func (p *proxyServer) setConfig(cfg config) {
+	old := p.currentConfig()
+	p.cfgMu.Lock()
+	p.cfg = cfg
+	p.cfgMu.Unlock()
+	if p.sessionRotator != nil {
+		p.sessionRotator.updateConfig(cfg)
+	}
+	if p.bridgePool != nil {
+		p.bridgePool.updateConfig(cfg)
+		if old.upstream.String() != cfg.upstream.String() || old.ccWSBridgePath != cfg.ccWSBridgePath || old.ccWSPoolMode != cfg.ccWSPoolMode {
+			p.bridgePool.reset()
+		}
+	}
 }
 
 func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if strings.HasPrefix(r.URL.Path, "/admin") {
+		p.serveAdmin(w, r)
+		return
+	}
+
 	if r.URL.Path == "/healthz" {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -287,8 +365,13 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	outBody := body
 	pathKind := requestPathKind(r.URL.Path)
-	if p.cfg.ccWSBridgeEnabled && pathKind == "anthropic" && r.Method == http.MethodPost {
+	if cfg.ccWSBridgeEnabled && pathKind == "anthropic" && r.Method == http.MethodPost {
 		if p.serveClaudeMessagesViaResponsesWS(w, r, body) {
+			return
+		}
+	}
+	if cfg.openAIResponsesWS && pathKind == "openai" && isResponsesPost(r) {
+		if p.serveOpenAIResponsesViaWS(w, r, body) {
 			return
 		}
 	}
@@ -313,7 +396,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if pathKind == "anthropic" {
 		ensureAnthropicBeta(req.Header)
 	}
-	req.Host = p.cfg.upstream.Host
+	req.Host = cfg.upstream.Host
 	req.ContentLength = int64(len(outBody))
 	req.Header.Del("Content-Length")
 	req.Header.Set("Accept-Encoding", "identity")
@@ -363,7 +446,8 @@ func contextWithClientCancel(r *http.Request) context.Context {
 }
 
 func (p *proxyServer) buildUpstreamURL(r *http.Request) string {
-	target := *p.cfg.upstream
+	cfg := p.currentConfig()
+	target := *cfg.upstream
 	basePath := strings.TrimRight(target.Path, "/")
 	reqPath := "/" + strings.TrimLeft(r.URL.Path, "/")
 	if basePath == "" || basePath == "/" {
@@ -462,6 +546,7 @@ func (p *proxyServer) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *proxyServer) openUpstreamWebSocket(in *http.Request, upstreamURL *url.URL, pathKind string) (net.Conn, *bufio.Reader, *http.Response, error) {
+	cfg := p.currentConfig()
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -486,7 +571,7 @@ func (p *proxyServer) openUpstreamWebSocket(in *http.Request, upstreamURL *url.U
 		Proto:      "HTTP/1.1",
 		ProtoMajor: 1,
 		ProtoMinor: 1,
-		Host:       p.cfg.upstream.Host,
+		Host:       cfg.upstream.Host,
 		Header:     make(http.Header),
 	}
 	copyWebSocketHeaders(outReq.Header, in.Header)
@@ -553,6 +638,7 @@ func writeHTTPResponseHead(writer io.Writer, resp *http.Response) error {
 
 func (p *proxyServer) pipeWebSocketFrames(direction string, reader *bufio.Reader, writer io.Writer, expectMasked bool, writeMasked bool, requestURI string, pathKind string) error {
 	for {
+		cfg := p.currentConfig()
 		frame, err := readWSFrame(reader)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
@@ -573,8 +659,8 @@ func (p *proxyServer) pipeWebSocketFrames(direction string, reader *bufio.Reader
 				frame.payload = injected
 			}
 			log.Printf("websocket text frame processed: path=%s kind=%s payload_bytes=%d changed=%v", requestURI, pathKind, len(original), changed)
-			if p.cfg.ccWSBridgeDebug || p.cfg.wsDebugPayloadBytes > 0 {
-				logWebSocketJSONSummary("websocket tunneled client frame", requestURI, frame.payload, p.cfg.wsDebugPayloadBytes)
+			if cfg.ccWSBridgeDebug || cfg.wsDebugPayloadBytes > 0 {
+				logWebSocketJSONSummary("websocket tunneled client frame", requestURI, frame.payload, cfg.wsDebugPayloadBytes)
 			}
 		}
 
@@ -777,6 +863,18 @@ func requestPathKind(path string) string {
 		return "anthropic"
 	default:
 		return "openai"
+	}
+}
+
+func isResponsesPost(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	switch strings.TrimRight(r.URL.Path, "/") {
+	case "/responses", "/v1/responses":
+		return true
+	default:
+		return false
 	}
 }
 

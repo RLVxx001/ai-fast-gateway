@@ -27,7 +27,8 @@ payloads before forwarding them.
 
 Claude Code `/v1/messages` can optionally be bridged to upstream `/responses` WebSocket.
 This mode is disabled by default and falls back to the normal HTTP proxy path before any
-response bytes are written if the upstream WebSocket cannot be opened.
+response bytes are written if the upstream WebSocket cannot be opened after the configured
+WS retry attempts.
 
 ```text
 CC_WS_BRIDGE_ENABLED=false
@@ -35,12 +36,24 @@ CC_WS_BRIDGE_UPSTREAM_PATH=/responses
 CC_WS_BRIDGE_FALLBACK_HTTP=true
 CC_WS_BRIDGE_DEBUG_FRAMES=false
 CC_WS_BRIDGE_FIRST_EVENT_TIMEOUT_MS=15000
+CC_WS_BRIDGE_MAX_ATTEMPTS=5
+CC_WS_BRIDGE_MAX_REQUEST_BYTES=0
+CC_WS_SESSION_ROTATE_ENABLED=false
+CC_WS_SESSION_ROTATE_THRESHOLD=2
+CC_WS_SESSION_ROTATE_STATE_FILE=
+OPENAI_RESPONSES_WS_BRIDGE_ENABLED=false
+OPENAI_RESPONSES_WS_BRIDGE_FALLBACK_HTTP=true
+OPENAI_RESPONSES_WS_BRIDGE_MAX_ATTEMPTS=1
+OPENAI_RESPONSES_WS_BRIDGE_MAX_REQUEST_BYTES=900000
 WS_DEBUG_PAYLOAD_BYTES=0
 CC_WS_POOL_MODE=client
 CC_WS_POOL_MAX_CONNS_PER_CLIENT=20
 CC_WS_POOL_MAX_IDLE_PER_CLIENT=20
 CC_WS_POOL_IDLE_TTL_SECONDS=600
 CC_WS_POOL_ACQUIRE_TIMEOUT_MS=3000
+ADMIN_ENABLED=false
+ADMIN_TOKEN=
+ADMIN_POLICY_STATE_FILE=
 ```
 
 ## Build
@@ -92,6 +105,7 @@ LOG_ROTATE_INTERVAL_MINUTES=0
 MAX_IDLE_CONNS=100
 MAX_IDLE_CONNS_PER_HOST=100
 CC_WS_BRIDGE_ENABLED=false
+CC_WS_BRIDGE_MAX_ATTEMPTS=5
 ```
 
 In `client` pool mode, each client identity gets a reusable upstream WS pool. A single
@@ -100,6 +114,35 @@ serially by later requests from the same session. Different sessions do not shar
 same WS connection, but they share the client's pool limit. The default pool size is
 20 upstream WS connections per client. Set `CC_WS_POOL_MODE=request` to use the old
 one-request-one-WS behavior.
+
+`CC_WS_BRIDGE_MAX_ATTEMPTS` controls how many upstream WebSocket attempts the Claude Code
+bridge makes before returning an error or falling back to HTTP when `CC_WS_BRIDGE_FALLBACK_HTTP`
+is enabled. Retries only happen before any response bytes are written to the client.
+
+Set `CC_WS_SESSION_ROTATE_ENABLED=true` to rotate a sticky session after repeated
+first-event failures such as EOF immediately after a successful 101 WebSocket handshake.
+The replacement session is remembered per client identity and original session. Set
+`CC_WS_SESSION_ROTATE_STATE_FILE=/logs/ws-session-rotate.json` to persist the mapping
+across container restarts.
+
+`OPENAI_RESPONSES_WS_BRIDGE_MAX_REQUEST_BYTES` skips the `/responses` WebSocket bridge
+when the encoded `response.create` event is larger than the configured byte limit. The
+request then falls back to the normal HTTP `/responses` proxy path. This avoids repeated
+101-then-EOF failures for very large payloads. Set it to `0` to disable this policy.
+
+## Admin Console
+
+Set `ADMIN_ENABLED=true` to serve the built-in console at `/admin/`. Set
+`ADMIN_TOKEN=change-me` to require a bearer token for admin APIs. The console shows
+runtime status, policy state, logs, session rotation mappings, and WebSocket pool
+snapshots. It also supports deleting or manually rotating existing session rotation
+mappings.
+
+The policy console can update bridge enablement, fallback, max attempts, large-request
+byte limits, session rotation, and WS debug preview settings at runtime. Set
+`ADMIN_POLICY_STATE_FILE=/logs/runtime-policy.json` to persist these runtime policy
+changes across container restarts. Pool sizing, pool mode, and upstream URL remain
+read-only in the console and should be changed through environment variables.
 
 Health check:
 
@@ -132,6 +175,7 @@ docker run -d \
   -e MAX_IDLE_CONNS=256 \
   -e MAX_IDLE_CONNS_PER_HOST=256 \
   -e CC_WS_BRIDGE_ENABLED=false \
+  -e CC_WS_BRIDGE_MAX_ATTEMPTS=5 \
   -e CC_WS_POOL_MODE=client \
   -e CC_WS_POOL_MAX_CONNS_PER_CLIENT=20 \
   ghcr.io/your-org/ai-fast-gateway:latest

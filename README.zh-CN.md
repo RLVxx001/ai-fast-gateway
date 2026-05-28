@@ -31,7 +31,7 @@ anthropic-beta: fast-mode-2026-02-01
 
 WebSocket Upgrade 请求也支持。网关会去掉 WebSocket 压缩扩展，并在客户端发往上游的 JSON 文本帧中补齐 `service_tier:"fast"`，例如 `response.create` 这类消息。
 
-Claude Code 的 `/v1/messages` 还可以可选桥接到上游 `/responses` WebSocket。该能力默认关闭；如果 WS 连接在写回客户端前失败，会回退到普通 HTTP 代理路径。
+Claude Code 的 `/v1/messages` 还可以可选桥接到上游 `/responses` WebSocket。该能力默认关闭；如果 WS 在写回客户端前失败，会先按配置重试上游 WebSocket，重试耗尽后再按 fallback 配置回退到普通 HTTP 代理路径或返回错误。
 
 ## 构建
 
@@ -101,6 +101,7 @@ docker run -d \
   -e MAX_IDLE_CONNS=256 \
   -e MAX_IDLE_CONNS_PER_HOST=256 \
   -e CC_WS_BRIDGE_ENABLED=false \
+  -e CC_WS_BRIDGE_MAX_ATTEMPTS=5 \
   ghcr.io/your-org/ai-fast-gateway:latest
 ```
 
@@ -140,12 +141,24 @@ CC_WS_BRIDGE_UPSTREAM_PATH=/responses
 CC_WS_BRIDGE_FALLBACK_HTTP=true
 CC_WS_BRIDGE_DEBUG_FRAMES=false
 CC_WS_BRIDGE_FIRST_EVENT_TIMEOUT_MS=15000
+CC_WS_BRIDGE_MAX_ATTEMPTS=5
+CC_WS_BRIDGE_MAX_REQUEST_BYTES=0
+CC_WS_SESSION_ROTATE_ENABLED=false
+CC_WS_SESSION_ROTATE_THRESHOLD=2
+CC_WS_SESSION_ROTATE_STATE_FILE=
+OPENAI_RESPONSES_WS_BRIDGE_ENABLED=false
+OPENAI_RESPONSES_WS_BRIDGE_FALLBACK_HTTP=true
+OPENAI_RESPONSES_WS_BRIDGE_MAX_ATTEMPTS=1
+OPENAI_RESPONSES_WS_BRIDGE_MAX_REQUEST_BYTES=900000
 WS_DEBUG_PAYLOAD_BYTES=0
 CC_WS_POOL_MODE=client
 CC_WS_POOL_MAX_CONNS_PER_CLIENT=20
 CC_WS_POOL_MAX_IDLE_PER_CLIENT=20
 CC_WS_POOL_IDLE_TTL_SECONDS=600
 CC_WS_POOL_ACQUIRE_TIMEOUT_MS=3000
+ADMIN_ENABLED=false
+ADMIN_TOKEN=
+ADMIN_POLICY_STATE_FILE=
 ```
 
 ## WebSocket 说明
@@ -159,6 +172,24 @@ CC_WS_BRIDGE_ENABLED=true
 ```
 
 开启后，Claude Code 的 `/v1/messages` 请求会被转换成上游 `/responses` WebSocket 请求，再把上游 WS 事件转换回 Anthropic SSE 响应。这个模式适合实验和调试，生产使用前建议先压测和观察日志。
+
+WS bridge 默认最多尝试 5 次上游 WebSocket：
+
+```text
+CC_WS_BRIDGE_MAX_ATTEMPTS=5
+```
+
+重试只发生在还没有向客户端写出响应头和响应内容之前，例如上游 WS 握手成功但第一条事件前 EOF。5 次都失败后，如果 `CC_WS_BRIDGE_FALLBACK_HTTP=true`，会回退到普通 HTTP `/v1/messages` 代理路径；如果为 `false`，则直接返回 502。
+
+如果某个 session 出现连续第一条事件前 EOF，可以开启自动 session 轮换：
+
+```text
+CC_WS_SESSION_ROTATE_ENABLED=true
+CC_WS_SESSION_ROTATE_THRESHOLD=2
+CC_WS_SESSION_ROTATE_STATE_FILE=/logs/ws-session-rotate.json
+```
+
+开启后，网关会按“客户端身份 + 原始 session”记录连续首帧失败次数，达到阈值后生成一个替代 session，并把后续请求中的 `prompt_cache_key`、`x-claude-code-session-id`、`x-codex-session-id`、`x-codex-window-id` 和 turn metadata 一起改成替代值。成功收到第一条上游事件后会清空失败计数。`CC_WS_SESSION_ROTATE_STATE_FILE` 为空时只保存在内存，容器重启后丢失；配置到 `/logs` 下可以跨重启保留。
 
 默认 WS 复用策略是 `client`：
 
@@ -177,6 +208,28 @@ CC_WS_POOL_ACQUIRE_TIMEOUT_MS=3000
 ```text
 CC_WS_POOL_MODE=request
 ```
+
+## Admin 控制台
+
+网关内置一个轻量控制台，默认关闭：
+
+```text
+ADMIN_ENABLED=true
+ADMIN_TOKEN=change-me
+ADMIN_POLICY_STATE_FILE=/logs/runtime-policy.json
+```
+
+开启后访问 `/admin/`。如果配置了 `ADMIN_TOKEN`，页面会要求输入 token，API 请求使用 Bearer token。控制台目前提供：
+
+- 运行状态、WS bridge、Responses bridge 和 session 轮换配置概览。
+- 策略控制台，可以热更新 OpenAI /responses bridge、Claude Code bridge、大请求绕过阈值、重试次数、HTTP fallback、session 轮换阈值和 WS 调试预览。
+- 日志读取和关键词过滤。
+- session 轮换映射查看、删除和手动强制轮换。
+- WebSocket 连接池 client/session/idle/busy 快照。
+
+`ADMIN_POLICY_STATE_FILE` 为空时，页面保存的策略只在当前进程内生效；配置到 `/logs/runtime-policy.json` 后会写入文件，容器重启后自动恢复。连接池模式、连接数、上游地址等结构性配置在控制台中只读，建议仍通过环境变量和重启调整。
+
+`OPENAI_RESPONSES_WS_BRIDGE_MAX_REQUEST_BYTES` 用于规避大请求在上游 WebSocket 101 后立刻 EOF 的情况。编码后的 `response.create` 超过该阈值时，网关会跳过 WS bridge，直接走普通 HTTP `/responses` 代理；设为 `0` 可关闭该策略。
 
 ## 注意事项
 

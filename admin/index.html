@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Fast Gateway</title>
+    <link rel="stylesheet" href="/admin/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">AF</div>
+          <div>
+            <div class="brand-title">AI Fast Gateway</div>
+            <div class="brand-subtitle">Operations Console</div>
+          </div>
+        </div>
+        <nav class="nav" aria-label="Console navigation">
+          <button class="nav-item active" data-view="overview" title="Overview">
+            <span class="nav-icon">⌁</span><span>概览</span>
+          </button>
+          <button class="nav-item" data-view="logs" title="Logs">
+            <span class="nav-icon">≡</span><span>日志</span>
+          </button>
+          <button class="nav-item" data-view="sessions" title="Sessions">
+            <span class="nav-icon">⟳</span><span>会话</span>
+          </button>
+          <button class="nav-item" data-view="policy" title="Policy">
+            <span class="nav-icon">◇</span><span>策略</span>
+          </button>
+          <button class="nav-item" data-view="pool" title="Pool">
+            <span class="nav-icon">◎</span><span>连接池</span>
+          </button>
+        </nav>
+        <div class="side-footer">
+          <div class="muted">Admin API</div>
+          <div id="authState" class="pill">checking</div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h1 id="pageTitle">概览</h1>
+            <p id="pageSubtitle">网关运行状态、WS bridge 和 session 轮换概览。</p>
+          </div>
+          <div class="top-actions">
+            <button id="refreshBtn" class="icon-button" title="刷新">↻</button>
+            <button id="tokenBtn" class="button secondary">Token</button>
+          </div>
+        </header>
+
+        <section id="tokenPanel" class="token-panel hidden">
+          <label for="tokenInput">Admin token</label>
+          <div class="token-row">
+            <input id="tokenInput" type="password" autocomplete="off" placeholder="Bearer token" />
+            <button id="saveTokenBtn" class="button">保存</button>
+            <button id="clearTokenBtn" class="button ghost">清除</button>
+          </div>
+        </section>
+
+        <section id="errorBox" class="error-box hidden"></section>
+
+        <section class="view active" id="view-overview">
+          <div class="metric-grid">
+            <article class="metric">
+              <div class="metric-label">运行时间</div>
+              <div id="uptime" class="metric-value">--</div>
+              <div id="startedAt" class="metric-note">--</div>
+            </article>
+            <article class="metric">
+              <div class="metric-label">WS 连接</div>
+              <div id="poolTotal" class="metric-value">--</div>
+              <div id="poolBreakdown" class="metric-note">--</div>
+            </article>
+            <article class="metric">
+              <div class="metric-label">Session 轮换</div>
+              <div id="rotationCount" class="metric-value">--</div>
+              <div id="rotationState" class="metric-note">--</div>
+            </article>
+            <article class="metric">
+              <div class="metric-label">上游</div>
+              <div id="upstream" class="metric-value compact">--</div>
+              <div id="logFile" class="metric-note">--</div>
+            </article>
+          </div>
+
+          <div class="content-grid">
+            <article class="panel">
+              <div class="panel-head">
+                <h2>Bridge</h2>
+                <span id="bridgeBadge" class="status-dot">--</span>
+              </div>
+              <dl class="kv" id="bridgeKV"></dl>
+            </article>
+            <article class="panel">
+              <div class="panel-head">
+                <h2>Responses</h2>
+                <span id="responsesBadge" class="status-dot">--</span>
+              </div>
+              <dl class="kv" id="responsesKV"></dl>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-logs">
+          <div class="toolbar">
+            <div class="search">
+              <input id="logGrep" type="search" placeholder="EOF / broken=true / session rotated / conn_id" />
+            </div>
+            <select id="logLines" title="日志行数">
+              <option value="200">200 行</option>
+              <option value="500" selected>500 行</option>
+              <option value="1000">1000 行</option>
+              <option value="2000">2000 行</option>
+            </select>
+            <button id="loadLogsBtn" class="button">读取</button>
+            <button id="downloadLogsBtn" class="button ghost">下载</button>
+            <button id="downloadAllLogsBtn" class="button ghost">全量</button>
+          </div>
+          <div id="logMeta" class="muted toolbar-note"></div>
+          <pre id="logOutput" class="log-output"></pre>
+        </section>
+
+        <section class="view" id="view-sessions">
+          <div class="section-intro">
+            <h2>Session 轮换映射</h2>
+            <p>连续首帧失败达到阈值后，原始 session 会映射到替代 session。这里可以查看、删除或强制轮换。</p>
+          </div>
+          <div id="sessionList" class="list"></div>
+        </section>
+
+        <section class="view" id="view-policy">
+          <div class="section-intro">
+            <h2>策略控制台</h2>
+            <p>调整运行中的桥接、绕过、重试和调试策略。连接池结构类配置保持只读，避免影响已有连接。</p>
+          </div>
+          <div class="policy-layout">
+            <form id="policyForm" class="policy-form">
+              <div class="form-head">
+                <div>
+                  <h2>运行策略</h2>
+                  <div id="policyPersistState" class="muted">--</div>
+                </div>
+                <button id="savePolicyBtn" class="button" type="submit">保存策略</button>
+              </div>
+
+              <div class="policy-section">
+                <div class="policy-section-head">
+                  <h3>路由</h3>
+                  <span class="pill ok">runtime</span>
+                </div>
+                <div class="form-grid">
+                  <label>
+                    <span>上游地址</span>
+                    <input id="upstream_url" type="url" placeholder="http://127.0.0.1:8080" />
+                  </label>
+                  <label>
+                    <span>WS bridge path</span>
+                    <input id="cc_ws_bridge_path" type="text" placeholder="/responses" />
+                  </label>
+                </div>
+                <div class="form-grid">
+                  <label>
+                    <span>首帧等待超时 ms</span>
+                    <input id="cc_ws_first_event_timeout_ms" type="number" min="1000" max="120000" step="1" />
+                  </label>
+                </div>
+              </div>
+
+              <div class="policy-section">
+                <div class="policy-section-head">
+                  <h3>OpenAI /responses</h3>
+                  <span class="pill" id="openaiPolicyBadge">--</span>
+                </div>
+                <label class="toggle-row">
+                  <span>启用 WS bridge</span>
+                  <input id="openai_responses_ws_enabled" type="checkbox" />
+                </label>
+                <label class="toggle-row">
+                  <span>失败回退 HTTP</span>
+                  <input id="openai_responses_ws_fallback" type="checkbox" />
+                </label>
+                <div class="form-grid">
+                  <label>
+                    <span>大请求绕过阈值 bytes</span>
+                    <input id="openai_responses_ws_max_request_bytes" type="number" min="0" step="1" />
+                  </label>
+                  <label>
+                    <span>最大尝试次数</span>
+                    <input id="openai_responses_ws_max_attempts" type="number" min="1" max="10" step="1" />
+                  </label>
+                </div>
+              </div>
+
+              <div class="policy-section">
+                <div class="policy-section-head">
+                  <h3>Claude Code bridge</h3>
+                  <span class="pill" id="ccPolicyBadge">--</span>
+                </div>
+                <label class="toggle-row">
+                  <span>启用 WS bridge</span>
+                  <input id="cc_ws_bridge_enabled" type="checkbox" />
+                </label>
+                <label class="toggle-row">
+                  <span>失败回退 HTTP</span>
+                  <input id="cc_ws_bridge_fallback" type="checkbox" />
+                </label>
+                <div class="form-grid">
+                  <label>
+                    <span>大请求绕过阈值 bytes</span>
+                    <input id="cc_ws_bridge_max_request_bytes" type="number" min="0" step="1" />
+                  </label>
+                  <label>
+                    <span>最大尝试次数</span>
+                    <input id="cc_ws_bridge_max_attempts" type="number" min="1" max="10" step="1" />
+                  </label>
+                </div>
+              </div>
+
+              <div class="policy-section">
+                <div class="policy-section-head">
+                  <h3>Session 与调试</h3>
+                  <span class="pill warn">谨慎开启</span>
+                </div>
+                <label class="toggle-row">
+                  <span>启用首帧失败 session 轮换</span>
+                  <input id="cc_ws_session_rotate_enabled" type="checkbox" />
+                </label>
+                <label class="toggle-row">
+                  <span>记录 WS frame 类型</span>
+                  <input id="cc_ws_bridge_debug_frames" type="checkbox" />
+                </label>
+                <div class="form-grid">
+                  <label>
+                    <span>轮换失败阈值</span>
+                    <input id="cc_ws_session_rotate_threshold" type="number" min="1" max="20" step="1" />
+                  </label>
+                  <label>
+                    <span>Payload 预览 bytes</span>
+                    <input id="ws_debug_payload_bytes" type="number" min="0" max="65536" step="1" />
+                  </label>
+                </div>
+              </div>
+            </form>
+
+            <aside class="policy-side">
+              <article class="panel">
+                <div class="panel-head">
+                  <h2>只读配置</h2>
+                </div>
+                <dl class="kv" id="policyReadOnly"></dl>
+              </article>
+              <article class="panel">
+                <div class="panel-head">
+                  <h2>策略摘要</h2>
+                </div>
+                <div id="policyList" class="policy-grid compact"></div>
+              </article>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-pool">
+          <div class="section-intro">
+            <h2>连接池</h2>
+            <p>按 client 和 session 查看当前上游 WebSocket 复用情况。</p>
+          </div>
+          <div id="poolList" class="list"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/admin/app.js"></script>
+  </body>
+</html>

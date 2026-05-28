@@ -67,6 +67,37 @@ type bridgeWSClientPool struct {
 	creating int
 }
 
+type bridgeWSPoolSnapshot struct {
+	Mode        string                   `json:"mode"`
+	MaxConns    int                      `json:"max_conns_per_client"`
+	MaxIdle     int                      `json:"max_idle_per_client"`
+	IdleTTL     string                   `json:"idle_ttl"`
+	AcquireWait string                   `json:"acquire_timeout"`
+	ClientCount int                      `json:"client_count"`
+	TotalConns  int                      `json:"total_conns"`
+	IdleConns   int                      `json:"idle_conns"`
+	BusyConns   int                      `json:"busy_conns"`
+	Clients     []bridgeWSClientSnapshot `json:"clients"`
+}
+
+type bridgeWSClientSnapshot struct {
+	ClientKey string                    `json:"client_key"`
+	Conns     int                       `json:"conns"`
+	Idle      int                       `json:"idle"`
+	Busy      int                       `json:"busy"`
+	Creating  int                       `json:"creating"`
+	Sessions  []bridgeWSSessionSnapshot `json:"sessions"`
+}
+
+type bridgeWSSessionSnapshot struct {
+	SessionKey string   `json:"session_key"`
+	Conns      int      `json:"conns"`
+	Idle       int      `json:"idle"`
+	Busy       int      `json:"busy"`
+	LastUsed   string   `json:"last_used"`
+	ConnIDs    []string `json:"conn_ids"`
+}
+
 func newBridgeWSPoolManager(cfg config) *bridgeWSPoolManager {
 	return &bridgeWSPoolManager{
 		cfg:     cfg,
@@ -74,8 +105,43 @@ func newBridgeWSPoolManager(cfg config) *bridgeWSPoolManager {
 	}
 }
 
+func (m *bridgeWSPoolManager) updateConfig(cfg config) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.cfg = cfg
+	m.mu.Unlock()
+}
+
+func (m *bridgeWSPoolManager) reset() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	pools := make([]*bridgeWSClientPool, 0, len(m.clients))
+	for _, pool := range m.clients {
+		pools = append(pools, pool)
+	}
+	m.clients = map[string]*bridgeWSClientPool{}
+	m.mu.Unlock()
+	for _, pool := range pools {
+		pool.closeAll()
+	}
+}
+
+func (m *bridgeWSPoolManager) currentConfig() config {
+	if m == nil {
+		return config{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cfg
+}
+
 func (p *proxyServer) acquireBridgeWebSocket(r *http.Request, sessionKey string) (*bridgeWSLease, error) {
-	if p.cfg.ccWSPoolMode == "request" {
+	cfg := p.currentConfig()
+	if cfg.ccWSPoolMode == "request" {
 		conn, reader, err := p.openBridgeWebSocket(r)
 		if err != nil {
 			return nil, err
@@ -83,16 +149,17 @@ func (p *proxyServer) acquireBridgeWebSocket(r *http.Request, sessionKey string)
 		return &bridgeWSLease{conn: conn, reader: reader, id: "request_" + randomHex(6), sessionKey: sessionKey}, nil
 	}
 	if p.bridgePool == nil {
-		p.bridgePool = newBridgeWSPoolManager(p.cfg)
+		p.bridgePool = newBridgeWSPoolManager(cfg)
 	}
 	return p.bridgePool.acquire(r.Context(), p, r, sessionKey)
 }
 
 func (m *bridgeWSPoolManager) acquire(ctx context.Context, proxy *proxyServer, r *http.Request, sessionKey string) (*bridgeWSLease, error) {
+	cfg := m.currentConfig()
 	clientKey := bridgeWSClientKey(r)
 	sessionKey = firstNonEmpty(sessionKey, "default")
 	pool := m.clientPool(clientKey)
-	timeout := m.cfg.ccWSPoolAcquireWait
+	timeout := cfg.ccWSPoolAcquireWait
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
@@ -116,6 +183,83 @@ func (m *bridgeWSPoolManager) clientPool(clientKey string) *bridgeWSClientPool {
 	return pool
 }
 
+func (m *bridgeWSPoolManager) snapshot() bridgeWSPoolSnapshot {
+	if m == nil {
+		return bridgeWSPoolSnapshot{}
+	}
+	m.mu.Lock()
+	pools := make([]*bridgeWSClientPool, 0, len(m.clients))
+	for _, pool := range m.clients {
+		pools = append(pools, pool)
+	}
+	m.mu.Unlock()
+	cfg := m.currentConfig()
+
+	snapshot := bridgeWSPoolSnapshot{
+		Mode:        cfg.ccWSPoolMode,
+		MaxConns:    cfg.ccWSPoolMaxConns,
+		MaxIdle:     cfg.ccWSPoolMaxIdle,
+		IdleTTL:     cfg.ccWSPoolIdleTTL.String(),
+		AcquireWait: cfg.ccWSPoolAcquireWait.String(),
+		ClientCount: len(pools),
+		Clients:     make([]bridgeWSClientSnapshot, 0, len(pools)),
+	}
+	for _, pool := range pools {
+		client := pool.snapshot()
+		snapshot.TotalConns += client.Conns
+		snapshot.IdleConns += client.Idle
+		snapshot.BusyConns += client.Busy
+		snapshot.Clients = append(snapshot.Clients, client)
+	}
+	sort.SliceStable(snapshot.Clients, func(i, j int) bool {
+		return snapshot.Clients[i].ClientKey < snapshot.Clients[j].ClientKey
+	})
+	return snapshot
+}
+
+func (p *bridgeWSClientPool) snapshot() bridgeWSClientSnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	bySession := map[string]*bridgeWSSessionSnapshot{}
+	client := bridgeWSClientSnapshot{
+		ClientKey: p.clientKey,
+		Conns:     len(p.conns),
+		Creating:  p.creating,
+	}
+	for _, conn := range p.conns {
+		idle := len(conn.avail) > 0
+		if idle {
+			client.Idle++
+		} else {
+			client.Busy++
+		}
+		session := bySession[conn.sessionKey]
+		if session == nil {
+			session = &bridgeWSSessionSnapshot{SessionKey: conn.sessionKey}
+			bySession[conn.sessionKey] = session
+		}
+		session.Conns++
+		if idle {
+			session.Idle++
+		} else {
+			session.Busy++
+		}
+		if session.LastUsed == "" {
+			session.LastUsed = conn.lastUsed.Format(time.RFC3339)
+		}
+		session.ConnIDs = append(session.ConnIDs, conn.id)
+	}
+	for _, session := range bySession {
+		sort.Strings(session.ConnIDs)
+		client.Sessions = append(client.Sessions, *session)
+	}
+	sort.SliceStable(client.Sessions, func(i, j int) bool {
+		return client.Sessions[i].SessionKey < client.Sessions[j].SessionKey
+	})
+	return client
+}
+
 func (p *bridgeWSClientPool) acquire(ctx context.Context, proxy *proxyServer, r *http.Request, sessionKey string) (*bridgeWSLease, error) {
 	started := time.Now()
 	for {
@@ -127,7 +271,7 @@ func (p *bridgeWSClientPool) acquire(ctx context.Context, proxy *proxyServer, r 
 				truncateLogValue(p.clientKey, 32), truncateLogValue(sessionKey, 16), conn.id, time.Since(started).Milliseconds())
 			return &bridgeWSLease{conn: conn.conn, reader: conn.reader, id: conn.id, reused: true, clientKey: p.clientKey, sessionKey: sessionKey, pooled: conn}, nil
 		}
-		maxConns := positiveOrDefault(p.manager.cfg.ccWSPoolMaxConns, 20)
+		maxConns := positiveOrDefault(p.manager.currentConfig().ccWSPoolMaxConns, 20)
 		if len(p.conns)+p.creating >= maxConns {
 			if evicted := p.evictOldestIdleOtherSessionLocked(sessionKey); evicted != nil {
 				p.mu.Unlock()
@@ -223,6 +367,23 @@ func (p *bridgeWSClientPool) release(conn *bridgeWSConn, broken bool) {
 		truncateLogValue(p.clientKey, 32), conn.id, broken)
 }
 
+func (p *bridgeWSClientPool) closeAll() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	conns := make([]net.Conn, 0, len(p.conns))
+	for _, conn := range p.conns {
+		conns = append(conns, conn.conn)
+	}
+	p.conns = map[string]*bridgeWSConn{}
+	p.creating = 0
+	p.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
 func (p *bridgeWSClientPool) evictOldestIdleOtherSessionLocked(sessionKey string) net.Conn {
 	var victim *bridgeWSConn
 	for _, conn := range p.conns {
@@ -249,7 +410,8 @@ func (p *bridgeWSClientPool) evictOldestIdleOtherSessionLocked(sessionKey string
 
 func (p *bridgeWSClientPool) cleanupLocked(now time.Time) net.Conn {
 	var closeConn net.Conn
-	ttl := p.manager.cfg.ccWSPoolIdleTTL
+	cfg := p.manager.currentConfig()
+	ttl := cfg.ccWSPoolIdleTTL
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
@@ -267,7 +429,7 @@ func (p *bridgeWSClientPool) cleanupLocked(now time.Time) net.Conn {
 		default:
 		}
 	}
-	maxIdle := p.manager.cfg.ccWSPoolMaxIdle
+	maxIdle := cfg.ccWSPoolMaxIdle
 	if maxIdle < 0 {
 		maxIdle = 0
 	}

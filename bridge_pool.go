@@ -226,6 +226,7 @@ func (p *bridgeWSClientPool) snapshot() bridgeWSClientSnapshot {
 		ClientKey: p.clientKey,
 		Conns:     len(p.conns),
 		Creating:  p.creating,
+		Sessions:  make([]bridgeWSSessionSnapshot, 0),
 	}
 	for _, conn := range p.conns {
 		idle := len(conn.avail) > 0

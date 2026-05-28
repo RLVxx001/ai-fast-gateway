@@ -172,7 +172,8 @@ function renderPool(pool) {
   }
   list.innerHTML = pool.clients
     .map((client) => {
-      const sessions = (client.sessions || [])
+      const sessionItems = client.sessions || [];
+      const sessions = sessionItems
         .map(
           (session) => `
             <div class="mini">
@@ -190,7 +191,7 @@ function renderPool(pool) {
               <div class="card-title">${escapeHTML(shorten(client.client_key, 72))}</div>
               <div class="card-subtitle">${client.conns} conns · ${client.idle} idle · ${client.busy} busy · ${client.creating} creating</div>
             </div>
-            <span class="pill ok">${client.sessions.length} sessions</span>
+            <span class="pill ok">${sessionItems.length} sessions</span>
           </div>
           <div class="mini-grid">${sessions}</div>
         </article>

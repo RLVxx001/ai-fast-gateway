@@ -64,7 +64,7 @@ func TestWebSocketProxyInjectsFastIntoOpenAIFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy := httptest.NewServer(&proxyServer{cfg: config{upstream: upstreamURL}})
+	proxy := httptest.NewServer(&proxyServer{cfg: config{upstream: upstreamURL, fastModeEnabled: true}})
 	defer proxy.Close()
 
 	conn, reader := openTestWebSocket(t, proxy.URL, "/responses")
@@ -113,6 +113,112 @@ func TestInjectFastIntoWebSocketResponseCreateWrapper(t *testing.T) {
 	response := event["response"].(map[string]any)
 	if response["service_tier"] != openAITier {
 		t.Fatalf("response.service_tier = %v, want %q", response["service_tier"], openAITier)
+	}
+}
+
+func TestWebSocketProxySkipsFastInjectionWhenDisabled(t *testing.T) {
+	upstreamPayload := make(chan map[string]any, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack upstream: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		accept := websocketAccept(r.Header.Get("Sec-WebSocket-Key"))
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept)
+		frame, err := readWSFrame(rw.Reader)
+		if err != nil {
+			t.Errorf("read upstream frame: %v", err)
+			return
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(frame.payload, &payload); err != nil {
+			t.Errorf("decode upstream payload: %v", err)
+			return
+		}
+		upstreamPayload <- payload
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(&proxyServer{cfg: config{upstream: upstreamURL, fastModeEnabled: false}})
+	defer proxy.Close()
+
+	conn, _ := openTestWebSocket(t, proxy.URL, "/responses")
+	defer conn.Close()
+	if err := writeWSFrame(conn, wsFrame{fin: true, opcode: 1, payload: []byte(`{"model":"gpt-5.5","stream":true}`)}, true); err != nil {
+		t.Fatalf("write client frame: %v", err)
+	}
+
+	select {
+	case payload := <-upstreamPayload:
+		if _, ok := payload["service_tier"]; ok {
+			t.Fatalf("service_tier injected while fast mode disabled: %v", payload["service_tier"])
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for upstream payload")
+	}
+}
+
+func TestHTTPProxySkipsFastInjectionAndBetaWhenDisabled(t *testing.T) {
+	upstreamBody := make(chan map[string]any, 1)
+	upstreamBeta := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode upstream payload: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		upstreamBody <- payload
+		upstreamBeta <- r.Header.Get("anthropic-beta")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(&proxyServer{
+		cfg:    config{upstream: upstreamURL, fastModeEnabled: false},
+		client: upstream.Client(),
+	})
+	defer proxy.Close()
+
+	resp, err := http.Post(proxy.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"gpt-5.5","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+
+	select {
+	case payload := <-upstreamBody:
+		if _, ok := payload["service_tier"]; ok {
+			t.Fatalf("service_tier injected while fast mode disabled: %v", payload["service_tier"])
+		}
+		if _, ok := payload["speed"]; ok {
+			t.Fatalf("speed injected while fast mode disabled: %v", payload["speed"])
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for upstream body")
+	}
+	select {
+	case beta := <-upstreamBeta:
+		if strings.Contains(beta, anthropicFastBeta) {
+			t.Fatalf("anthropic fast beta injected while fast mode disabled: %q", beta)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for upstream beta")
 	}
 }
 

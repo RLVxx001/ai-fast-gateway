@@ -15,6 +15,7 @@ COPY --from=builder /out/ai-fast-gateway /usr/local/bin/ai-fast-gateway
 
 ENV LISTEN_ADDR=:8317
 ENV UPSTREAM_URL=http://127.0.0.1:8080
+ENV FAST_MODE_ENABLED=true
 ENV LOG_FILE=/logs/ai-fast-gateway.log
 ENV LOG_MAX_SIZE_MB=20
 ENV LOG_MAX_BACKUPS=5

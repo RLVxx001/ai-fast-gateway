@@ -129,6 +129,7 @@ func TestClaudeWSBridgeStreamsAnthropicSSE(t *testing.T) {
 		t.Fatal(err)
 	}
 	proxy := httptest.NewServer(&proxyServer{cfg: config{
+		fastModeEnabled:    true,
 		upstream:           upstreamURL,
 		ccWSBridgeEnabled:  true,
 		ccWSBridgePath:     "/responses",

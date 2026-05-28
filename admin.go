@@ -73,6 +73,7 @@ type adminPolicyResponse struct {
 
 type adminPolicyFields struct {
 	UpstreamURL                      string `json:"upstream_url"`
+	FastModeEnabled                  bool   `json:"fast_mode_enabled"`
 	CCWSBridgePath                   string `json:"cc_ws_bridge_path"`
 	CCWSFirstEventTimeoutMS          int    `json:"cc_ws_first_event_timeout_ms"`
 	OpenAIResponsesWSEnabled         bool   `json:"openai_responses_ws_enabled"`
@@ -91,6 +92,7 @@ type adminPolicyFields struct {
 
 type adminPolicyPatch struct {
 	UpstreamURL                      *string `json:"upstream_url"`
+	FastModeEnabled                  *bool   `json:"fast_mode_enabled"`
 	CCWSBridgePath                   *string `json:"cc_ws_bridge_path"`
 	CCWSFirstEventTimeoutMS          *int    `json:"cc_ws_first_event_timeout_ms"`
 	OpenAIResponsesWSEnabled         *bool   `json:"openai_responses_ws_enabled"`
@@ -264,6 +266,11 @@ func (p *proxyServer) adminPolicy() adminPolicyResponse {
 	cfg := p.currentConfig()
 	items := []adminPolicyItem{
 		{
+			Name:        "Fast 注入",
+			Status:      enabledStatus(cfg.fastModeEnabled),
+			Description: "开启时补齐 service_tier=fast、Anthropic speed=fast、fast beta header，并处理 WS response.create。",
+		},
+		{
 			Name:        "OpenAI /responses WS bridge",
 			Status:      enabledStatus(cfg.openAIResponsesWS),
 			Description: "HTTP /responses 请求会优先转换为上游 /responses WebSocket。",
@@ -325,8 +332,8 @@ func (p *proxyServer) serveUpdateAdminPolicy(w http.ResponseWriter, r *http.Requ
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	log.Printf("admin runtime policy updated: openai_responses_ws=%v openai_max_bytes=%d openai_attempts=%d cc_ws=%v cc_max_bytes=%d cc_attempts=%d session_rotate=%v session_threshold=%d debug_payload_bytes=%d",
-		cfg.openAIResponsesWS, cfg.openAIResponsesWSMaxRequestBytes, cfg.openAIResponsesWSMaxAttempts,
+	log.Printf("admin runtime policy updated: fast_mode_enabled=%v openai_responses_ws=%v openai_max_bytes=%d openai_attempts=%d cc_ws=%v cc_max_bytes=%d cc_attempts=%d session_rotate=%v session_threshold=%d debug_payload_bytes=%d",
+		cfg.fastModeEnabled, cfg.openAIResponsesWS, cfg.openAIResponsesWSMaxRequestBytes, cfg.openAIResponsesWSMaxAttempts,
 		cfg.ccWSBridgeEnabled, cfg.ccWSBridgeMaxRequestBytes, cfg.ccWSBridgeMaxAttempts,
 		cfg.ccWSSessionRotateEnabled, cfg.ccWSSessionRotateThreshold, cfg.wsDebugPayloadBytes)
 	writeAdminJSON(w, p.adminPolicy())
@@ -335,6 +342,7 @@ func (p *proxyServer) serveUpdateAdminPolicy(w http.ResponseWriter, r *http.Requ
 func adminPolicyFieldsFromConfig(cfg config) adminPolicyFields {
 	return adminPolicyFields{
 		UpstreamURL:                      cfg.upstream.String(),
+		FastModeEnabled:                  cfg.fastModeEnabled,
 		CCWSBridgePath:                   cfg.ccWSBridgePath,
 		CCWSFirstEventTimeoutMS:          int(cfg.ccWSFirstEventWait / time.Millisecond),
 		OpenAIResponsesWSEnabled:         cfg.openAIResponsesWS,
@@ -359,6 +367,9 @@ func applyAdminPolicyPatch(cfg *config, patch adminPolicyPatch) error {
 			return err
 		}
 		cfg.upstream = upstream
+	}
+	if patch.FastModeEnabled != nil {
+		cfg.fastModeEnabled = *patch.FastModeEnabled
 	}
 	if patch.CCWSBridgePath != nil {
 		cfg.ccWSBridgePath = normalizePath(*patch.CCWSBridgePath, "/responses")
@@ -421,6 +432,11 @@ func loadAdminRuntimePolicyOverrides(cfg config) config {
 		log.Printf("admin runtime policy decode failed: file=%s err=%v", cfg.adminPolicyStateFile, err)
 		return cfg
 	}
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawFields); err != nil {
+		log.Printf("admin runtime policy decode failed: file=%s err=%v", cfg.adminPolicyStateFile, err)
+		return cfg
+	}
 	patch := adminPolicyPatch{
 		OpenAIResponsesWSEnabled:         &fields.OpenAIResponsesWSEnabled,
 		OpenAIResponsesWSMaxRequestBytes: &fields.OpenAIResponsesWSMaxRequestBytes,
@@ -437,6 +453,9 @@ func loadAdminRuntimePolicyOverrides(cfg config) config {
 	}
 	if fields.UpstreamURL != "" {
 		patch.UpstreamURL = &fields.UpstreamURL
+	}
+	if _, ok := rawFields["fast_mode_enabled"]; ok {
+		patch.FastModeEnabled = &fields.FastModeEnabled
 	}
 	if fields.CCWSBridgePath != "" {
 		patch.CCWSBridgePath = &fields.CCWSBridgePath

@@ -2,7 +2,8 @@
 
 [中文说明](README.zh-CN.md)
 
-HTTP/WebSocket proxy that forwards requests to `UPSTREAM_URL` and force-writes fast-mode fields.
+HTTP/WebSocket proxy that forwards requests to `UPSTREAM_URL` and force-writes fast-mode fields
+when `FAST_MODE_ENABLED=true` (the default).
 
 ```json
 {"service_tier":"fast"}
@@ -31,6 +32,7 @@ response bytes are written if the upstream WebSocket cannot be opened after the 
 WS retry attempts.
 
 ```text
+FAST_MODE_ENABLED=true
 CC_WS_BRIDGE_ENABLED=false
 CC_WS_BRIDGE_UPSTREAM_PATH=/responses
 CC_WS_BRIDGE_FALLBACK_HTTP=true
@@ -98,7 +100,9 @@ Useful environment variables and flags:
 ```text
 -listen   listen address, default :8317
 -upstream upstream base URL, default http://127.0.0.1:8080
+-fast-mode-enabled inject fast-mode fields and Anthropic fast beta headers, default true
 -log-file log file path, default is ai-fast-gateway.log next to the executable
+FAST_MODE_ENABLED=true
 LOG_MAX_SIZE_MB=20
 LOG_MAX_BACKUPS=5
 LOG_ROTATE_INTERVAL_MINUTES=0

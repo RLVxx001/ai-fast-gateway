@@ -38,6 +38,7 @@ const (
 type config struct {
 	listenAddr                       string
 	upstream                         *url.URL
+	fastModeEnabled                  bool
 	logFile                          string
 	logMaxSizeMB                     int
 	logMaxBackups                    int
@@ -109,8 +110,8 @@ func main() {
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
-	log.Printf("ai-fast-gateway listening on %s, upstream=%s, openai_service_tier=%s, anthropic_speed=%s, anthropic_beta=%s",
-		cfg.listenAddr, cfg.upstream.String(), openAITier, anthropicSpeed, anthropicFastBeta)
+	log.Printf("ai-fast-gateway listening on %s, upstream=%s, fast_mode_enabled=%v, openai_service_tier=%s, anthropic_speed=%s, anthropic_beta=%s",
+		cfg.listenAddr, cfg.upstream.String(), cfg.fastModeEnabled, openAITier, anthropicSpeed, anthropicFastBeta)
 	log.Printf("transport config: max_idle_conns=%d, max_idle_conns_per_host=%d, disable_compression=true",
 		cfg.maxIdleConns, cfg.maxIdleConnsPerHost)
 	log.Printf("cc websocket bridge: enabled=%v, path=%s, fallback_http=%v, debug_frames=%v, max_attempts=%d max_request_bytes=%d",
@@ -134,6 +135,7 @@ func main() {
 func loadConfig() (config, error) {
 	listenAddr := flag.String("listen", envOrDefault("LISTEN_ADDR", defaultListenAddr), "listen address, for example :8317 or 127.0.0.1:8317")
 	upstreamRaw := flag.String("upstream", envOrDefault("UPSTREAM_URL", defaultUpstreamURL), "upstream base URL")
+	fastModeEnabled := flag.Bool("fast-mode-enabled", envBoolOrDefault("FAST_MODE_ENABLED", true), "inject fast-mode fields and Anthropic fast beta headers")
 	logFile := flag.String("log-file", envOrDefault("LOG_FILE", defaultLogFile()), "log file path")
 	logMaxSizeMB := flag.Int("log-max-size-mb", envIntOrDefault("LOG_MAX_SIZE_MB", 20), "maximum log file size in MB before rotation, 0 disables size rotation")
 	logMaxBackups := flag.Int("log-max-backups", envIntOrDefault("LOG_MAX_BACKUPS", 5), "maximum rotated log files to keep, 0 keeps all")
@@ -175,6 +177,7 @@ func loadConfig() (config, error) {
 	return config{
 		listenAddr:                       strings.TrimSpace(*listenAddr),
 		upstream:                         upstream,
+		fastModeEnabled:                  *fastModeEnabled,
 		logFile:                          strings.TrimSpace(*logFile),
 		logMaxSizeMB:                     maxInt(*logMaxSizeMB, 0),
 		logMaxBackups:                    maxInt(*logMaxBackups, 0),
@@ -375,7 +378,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if shouldInjectTier(r, body) {
+	if cfg.fastModeEnabled && shouldInjectTier(r, body) {
 		hadFastBefore := bodyHasFastField(body, pathKind)
 		outBody, err = injectFastField(body, pathKind)
 		if err != nil {
@@ -393,7 +396,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copyHeaders(req.Header, r.Header)
-	if pathKind == "anthropic" {
+	if cfg.fastModeEnabled && pathKind == "anthropic" {
 		ensureAnthropicBeta(req.Header)
 	}
 	req.Host = cfg.upstream.Host
@@ -580,7 +583,7 @@ func (p *proxyServer) openUpstreamWebSocket(in *http.Request, upstreamURL *url.U
 	outReq.Header.Set("Accept-Encoding", "identity")
 	outReq.Header.Del("Sec-Websocket-Extensions")
 	outReq.Header.Del("Sec-WebSocket-Extensions")
-	if pathKind == "anthropic" {
+	if cfg.fastModeEnabled && pathKind == "anthropic" {
 		ensureAnthropicBeta(outReq.Header)
 	}
 
@@ -652,11 +655,15 @@ func (p *proxyServer) pipeWebSocketFrames(direction string, reader *bufio.Reader
 
 		if direction == "client_to_upstream" && frame.opcode == 1 {
 			original := frame.payload
-			injected, changed, err := injectFastIntoWebSocketTextPayload(frame.payload, pathKind)
-			if err != nil {
-				log.Printf("websocket fast injection skipped: path=%s payload_bytes=%d err=%v", requestURI, len(frame.payload), err)
-			} else if changed {
-				frame.payload = injected
+			changed := false
+			if cfg.fastModeEnabled {
+				injected, injectedChanged, err := injectFastIntoWebSocketTextPayload(frame.payload, pathKind)
+				if err != nil {
+					log.Printf("websocket fast injection skipped: path=%s payload_bytes=%d err=%v", requestURI, len(frame.payload), err)
+				} else if injectedChanged {
+					frame.payload = injected
+					changed = true
+				}
 			}
 			log.Printf("websocket text frame processed: path=%s kind=%s payload_bytes=%d changed=%v", requestURI, pathKind, len(original), changed)
 			if cfg.ccWSBridgeDebug || cfg.wsDebugPayloadBytes > 0 {

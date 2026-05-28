@@ -78,7 +78,7 @@ func (p *proxyServer) serveClaudeMessagesViaResponsesWS(w http.ResponseWriter, r
 		createEvent[key] = value
 	}
 	createEvent["type"] = "response.create"
-	normalizeResponsesWebSocketCreate(createEvent)
+	normalizeResponsesWebSocketCreate(createEvent, cfg.fastModeEnabled)
 	sessionKey := bridgeWSSessionKey(r, responseReq)
 	if clientMetadata := bridgeClientMetadataForSession(r, sessionKey); len(clientMetadata) > 0 {
 		createEvent["client_metadata"] = clientMetadata
@@ -494,9 +494,11 @@ func translateClaudeToResponses(req claudeBridgeRequest, sessionID string) (map[
 	return out, nil
 }
 
-func normalizeResponsesWebSocketCreate(payload map[string]any) {
+func normalizeResponsesWebSocketCreate(payload map[string]any, fastModeEnabled bool) {
 	delete(payload, "max_output_tokens")
-	injectFastIntoMap(payload, "openai")
+	if fastModeEnabled {
+		injectFastIntoMap(payload, "openai")
+	}
 }
 
 func translateClaudeSystem(system any) string {

@@ -14,7 +14,7 @@ import (
 
 func (p *proxyServer) serveOpenAIResponsesViaWS(w http.ResponseWriter, r *http.Request, body []byte) bool {
 	cfg := p.currentConfig()
-	createBytes, stream, model, sessionKey, err := buildOpenAIResponsesCreateEvent(r, body)
+	createBytes, stream, model, sessionKey, err := buildOpenAIResponsesCreateEvent(r, body, cfg.fastModeEnabled)
 	if err != nil {
 		http.Error(w, "invalid responses json", http.StatusBadRequest)
 		return true
@@ -66,13 +66,13 @@ func (p *proxyServer) serveOpenAIResponsesViaWS(w http.ResponseWriter, r *http.R
 	return true
 }
 
-func buildOpenAIResponsesCreateEvent(r *http.Request, body []byte) ([]byte, bool, string, string, error) {
+func buildOpenAIResponsesCreateEvent(r *http.Request, body []byte, fastModeEnabled bool) ([]byte, bool, string, string, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(bytes.TrimSpace(body), &payload); err != nil {
 		return nil, false, "", "", err
 	}
 	payload["type"] = "response.create"
-	normalizeResponsesWebSocketCreate(payload)
+	normalizeResponsesWebSocketCreate(payload, fastModeEnabled)
 	sessionKey := firstNonEmpty(stringOrDefault(payload["prompt_cache_key"], ""), r.Header.Get("x-codex-window-id"), r.Header.Get("x-codex-session-id"), "responses")
 	if _, ok := payload["client_metadata"]; !ok {
 		if clientMetadata := bridgeClientMetadataForSession(r, sessionKey); len(clientMetadata) > 0 {

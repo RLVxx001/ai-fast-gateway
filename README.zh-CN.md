@@ -1,6 +1,6 @@
 # AI Fast Gateway 中文说明
 
-AI Fast Gateway 是一个轻量级 HTTP/WebSocket 中转网关，用来把 Codex、Claude Code、ccswitch 等客户端请求转发到上游服务，同时强制补齐 fast mode 相关参数。它还可以把 Claude Code 的 `/v1/messages` 请求转换成上游 `/responses` WebSocket 请求，用于让原本走 Anthropic Messages/SSE 的 Claude Code 链路接入支持 Responses WebSocket 的上游。
+AI Fast Gateway 是一个轻量级 HTTP/WebSocket 中转网关，用来把 Codex、Claude Code、ccswitch 等客户端请求转发到上游服务，同时按配置补齐 fast mode 相关参数。`FAST_MODE_ENABLED` 默认开启，关闭后不会再写入 fast 参数和 Anthropic fast beta header。它还可以把 Claude Code 的 `/v1/messages` 请求转换成上游 `/responses` WebSocket 请求，用于让原本走 Anthropic Messages/SSE 的 Claude Code 链路接入支持 Responses WebSocket 的上游。
 
 它适合放在客户端和 sub2api / OpenAI 兼容服务之间，既可以做普通 HTTP/SSE fast 参数注入，也可以在需要时做 Claude Code 到 Responses WebSocket 的桥接：
 
@@ -56,6 +56,7 @@ go build -o ai-fast-gateway .
 ```text
 LISTEN_ADDR=127.0.0.1:18317
 UPSTREAM_URL=http://127.0.0.1:8080
+FAST_MODE_ENABLED=true
 LOG_FILE=./ai-fast-gateway.log
 LOG_MAX_SIZE_MB=20
 LOG_MAX_BACKUPS=5
@@ -94,6 +95,7 @@ docker run -d \
   -v /opt/ai-fast-gateway/logs:/logs \
   -e LISTEN_ADDR=:8317 \
   -e UPSTREAM_URL=http://sub2api:8080 \
+  -e FAST_MODE_ENABLED=true \
   -e LOG_FILE=/logs/ai-fast-gateway.log \
   -e LOG_MAX_SIZE_MB=20 \
   -e LOG_MAX_BACKUPS=5 \

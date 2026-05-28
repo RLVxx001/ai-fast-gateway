@@ -207,8 +207,10 @@ function renderPolicy(policy) {
     if (!input) continue;
     if (input.type === "checkbox") {
       input.checked = Boolean(value);
-    } else {
+    } else if (input.type === "number") {
       input.value = Number(value || 0);
+    } else {
+      input.value = value ?? "";
     }
   }
 
@@ -253,6 +255,7 @@ function renderPolicy(policy) {
 
 function collectPolicyFields() {
   const boolIDs = [
+    "fast_mode_enabled",
     "openai_responses_ws_enabled",
     "openai_responses_ws_fallback",
     "cc_ws_bridge_enabled",
